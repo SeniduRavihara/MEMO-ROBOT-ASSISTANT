@@ -9,6 +9,7 @@
 // Audio settings
 #define SAMPLE_RATE 16000 // 16kHz is standard for voice transcription
 #define MIC_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_32BIT
+#define MIC_GAIN 8 // Artificial volume multiplier for distant speech
 
 void setup() {
   // Use a fast baud rate for raw audio data
@@ -54,9 +55,16 @@ void loop() {
     int samples_read = bytesIn / sizeof(wave[0]);
     int16_t out_wave[512];
     
-    // Shift 24-bit data inside 32-bit frame to 16-bit to save bandwidth over serial
+    // Shift 24-bit data inside 32-bit frame to 16-bit, then apply software gain
     for (int i = 0; i < samples_read; ++i) {
-      out_wave[i] = (int16_t)(wave[i] >> 16); 
+      int32_t sample = wave[i] >> 16;
+      sample = sample * MIC_GAIN;
+      
+      // Clamp to 16-bit boundaries to prevent distortion/wrapping
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+      
+      out_wave[i] = (int16_t)sample; 
     }
 
     // Write raw binary bytes straight to the Serial port
