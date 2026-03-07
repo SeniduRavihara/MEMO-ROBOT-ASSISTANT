@@ -33,6 +33,7 @@ html = """
             body { font-family: sans-serif; padding: 20px; background-color: #f4f4f9; }
             h1 { color: #333; }
             #status { color: #666; font-style: italic; }
+            #controls { margin-top: 20px; }
             #container { 
                 margin-top: 20px; padding: 20px; 
                 background: white; border-radius: 8px;
@@ -45,16 +46,32 @@ html = """
     </head>
     <body>
         <h1>Live Audio Transcription</h1>
+        <div id="controls">
+            <label for="lang-select"><strong>Transcription Language:</strong></label>
+            <select id="lang-select">
+                <option value="en-US">English (US)</option>
+                <option value="si-LK">Sinhala (Sri Lanka)</option>
+            </select>
+        </div>
         <p id="status">Connecting to server...</p>
         <div id="container"></div>
         <script>
             var ws = new WebSocket("ws://" + location.host + "/ws");
             var statusEl = document.getElementById("status");
             var container = document.getElementById("container");
+            var langSelect = document.getElementById("lang-select");
+
+            langSelect.addEventListener('change', function() {
+                // Tell the server we changed the language
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send("LANG:" + this.value);
+                }
+            });
 
             ws.onopen = function() {
                 statusEl.innerText = "Connected! Speak into your ESP32 microphone.";
                 statusEl.style.color = "green";
+                ws.send("LANG:" + langSelect.value);
             };
             
             ws.onmessage = function(event) {
@@ -84,6 +101,9 @@ html = """
 # Global list of connected websocket clients
 connected_clients = set()
 
+# The current language to transcribe in
+current_language = "en-US"
+
 def calculate_rms(audio_bytes):
     """Calculates the Root Mean Square energy to detect volume/speaking."""
     count = len(audio_bytes) // 2
@@ -94,7 +114,7 @@ def calculate_rms(audio_bytes):
     sum_squares = sum(int(s)*int(s) for s in shorts)
     return math.sqrt(sum_squares / count)
 
-def transcribe_audio_bytes(audio_bytes):
+def transcribe_audio_bytes(audio_bytes, lang):
     """Sends the raw WAV bytes to Google Speech recognition."""
     recognizer = sr.Recognizer()
     
@@ -111,7 +131,8 @@ def transcribe_audio_bytes(audio_bytes):
     try:
         with sr.AudioFile(wav_io) as source:
             audio = recognizer.record(source)
-        text = recognizer.recognize_google(audio)
+        # Pass the desired language directly to the API!
+        text = recognizer.recognize_google(audio, language=lang)
         return text
     except sr.UnknownValueError:
         return "" # Audio was silent or unintelligible
@@ -173,18 +194,20 @@ def audio_listener_loop(active_loop):
                         # Copy buffer so we can reset the main one immediately
                         buffer_copy = bytearray(phrase_buffer) 
                         
-                        def do_transcribe(buf):
-                            txt = transcribe_audio_bytes(buf)
+                        def do_transcribe(buf, lang_to_use):
+                            txt = transcribe_audio_bytes(buf, lang_to_use)
                             if txt:
-                                print(f"Transcribed: {txt}")
+                                print(f"Transcribed [{lang_to_use}]: {txt}")
                                 asyncio.run_coroutine_threadsafe(broadcast_message(txt), active_loop)
                             else:
-                                print("Transcription returned empty.")
+                                print(f"Transcription [{lang_to_use}] returned empty.")
                                 # Let UI know we are done processing even if it failed
                                 asyncio.run_coroutine_threadsafe(broadcast_message(""), active_loop) 
 
+                        # Grab the currently selected language snapshot
+                        lang_snapshot = current_language
                         # Run the heavy, blocking Google API call in a background executor
-                        active_loop.run_in_executor(None, do_transcribe, buffer_copy)
+                        active_loop.run_in_executor(None, do_transcribe, buffer_copy, lang_snapshot)
                         
                     # Reset buffer for the next phrase instantly so we don't miss words
                     phrase_buffer = bytearray()
@@ -201,11 +224,16 @@ async def get():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    global current_language
     await websocket.accept()
     connected_clients.add(websocket)
     try:
         while True:
-            await websocket.receive_text()
+            data = await websocket.receive_text()
+            if data.startswith("LANG:"):
+                new_lang = data.split(":")[1]
+                print(f"Client changed language to: {new_lang}")
+                current_language = new_lang
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
 
