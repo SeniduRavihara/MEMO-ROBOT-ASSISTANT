@@ -48,6 +48,9 @@ void setup()
 
   initDisplay();
 
+  // Custom addition: Initialize Amplifier for passthrough!
+  initAmplifier();
+
   delay(1000);
 }
 

@@ -65,31 +65,36 @@ void initMicrophone()
 
 bool getWave() 
 {
-
-  //for (int i = 0; i < SAMPLE_BUFFER_SIZE; ++i) {
-  //  wave[i] = 0;
-  //}
-
   size_t bytesIn = 0;
   esp_err_t result = i2s_read(I2S_PORT, &wave, sizeof(wave), &bytesIn, portMAX_DELAY);
-  /*
-  */  
+  
   if (result == ESP_OK)
   {
     maxWave = 0.0;
     int tmp;
     int samples_read = bytesIn / sizeof(wave[0]);
+
+    // Create a temporary buffer for the speaker output format (16-bit)
+    int16_t amp_wave[SAMPLE_BUFFER_SIZE];
+
     if (samples_read > 0) {
-      //Serial.println(samples_read);
       for (int i = 0; i < samples_read; ++i) {
-        //wave[i] /= 4096;
+        
+        // --- 1. Audio formatting for speaker ---
+        // The INMP441 uses 24-bit data inside 32 bits. We shift it down to fit in 16 bits.
+        amp_wave[i] = (int16_t)(wave[i] >> 16); 
+        
+        // --- 2. Audio formatting for Display/FFT ---
         wave[i] >>= 16;
         if((tmp=abs(wave[i])) > maxWave)
         {
           maxWave = tmp;
         }
-        //Serial.println(wave[i]);
       }
+
+      // Write the corrected samples out to the amplifier
+      size_t bytesOut = 0;
+      i2s_write(I2S_NUM_1, &amp_wave, samples_read * sizeof(amp_wave[0]), &bytesOut, portMAX_DELAY);
     }
   }
   return result;
@@ -112,6 +117,33 @@ void i2s_install() {
   };
 
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+}
+
+void initAmplifier() {
+  Serial.println("Setup I2S Amplifier...");
+  
+  const i2s_config_t i2s_amp_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, // Force to 16-bit for amplifier
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64,
+    .use_apll = false
+  };
+
+  const i2s_pin_config_t pin_amp_config = {
+    .bck_io_num = 14, // Custom BCLK
+    .ws_io_num = 27,  // Custom LRC
+    .data_out_num = 33, // Custom DIN
+    .data_in_num = -1
+  };
+
+  i2s_driver_install(I2S_NUM_1, &i2s_amp_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_1, &pin_amp_config);
+  i2s_start(I2S_NUM_1);
 }
 
 void i2s_setpin() {
