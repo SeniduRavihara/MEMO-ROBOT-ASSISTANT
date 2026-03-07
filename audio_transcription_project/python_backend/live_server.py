@@ -198,6 +198,11 @@ def audio_listener_loop(active_loop):
                             txt = transcribe_audio_bytes(buf, lang_to_use)
                             if txt:
                                 print(f"Transcribed [{lang_to_use}]: {txt}")
+                                try:
+                                    # Send text back to ESP32 so it can display it!
+                                    ser.write((txt + "\n").encode('utf-8'))
+                                except Exception as e:
+                                    print("Serial write error:", e)
                                 asyncio.run_coroutine_threadsafe(broadcast_message(txt), active_loop)
                             else:
                                 print(f"Transcription [{lang_to_use}] returned empty.")

@@ -1,4 +1,6 @@
 #include <driver/i2s.h>
+#include <Wire.h>
+#include <U8g2lib.h>
 
 // I2S Microphone Pins (INMP441)
 #define I2S_WS GPIO_NUM_25
@@ -11,14 +13,40 @@
 #define MIC_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_32BIT
 #define MIC_GAIN 8 // Artificial volume multiplier for distant speech
 
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
+
+void showText(String text) {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  
+  // Basic text wrapping (max 21 chars per line)
+  int y = 10;
+  int startIdx = 0;
+  while (startIdx < text.length()) {
+    String line = text.substring(startIdx, startIdx + 21);
+    u8g2.drawStr(0, y, line.c_str());
+    y += 12;
+    startIdx += 21;
+    if (y > 60) break; // Screen full
+  }
+  
+  u8g2.sendBuffer();
+}
+
 void setup() {
   // Use a fast baud rate for raw audio data
   Serial.begin(921600);
+  Serial.setTimeout(10); // Very short timeout so we don't block audio
   
+  Wire.begin(4, 15);
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 10, "Listening to MEMO...");
+  u8g2.sendBuffer();
+
   // Wait a moment for serial to initialize
   delay(1000);
-  // Optional: print a special start sequence so Python knows when to listen
-  // Serial.println("START_MIC"); 
 
   const i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -45,6 +73,15 @@ void setup() {
 }
 
 void loop() {
+  // Check if Python sent any text to display
+  if (Serial.available()) {
+    String text = Serial.readStringUntil('\n');
+    text.trim();
+    if (text.length() > 0) {
+      showText(text);
+    }
+  }
+
   size_t bytesIn = 0;
   // A chunk of 512 samples
   int32_t wave[512]; 
