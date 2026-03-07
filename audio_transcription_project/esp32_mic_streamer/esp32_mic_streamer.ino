@@ -1,6 +1,17 @@
 #include <driver/i2s.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+
+// --- WIFI CONFIGURATION ---
+const char* ssid = "4G-Senidu";
+const char* password = "1234567890";
+
+// --- PYTHON SERVER IP ---
+const char* host = "192.168.100.243"; // Your computer's IP address
+const uint16_t port = 8002;
+
+WiFiClient client;
 
 // I2S Microphone Pins (INMP441)
 #define I2S_WS GPIO_NUM_25
@@ -34,19 +45,47 @@ void showText(String text) {
 }
 
 void setup() {
-  // Use a fast baud rate for raw audio data
-  Serial.begin(921600);
-  Serial.setTimeout(10); // Very short timeout so we don't block audio
+  Serial.begin(115200);
   
   Wire.begin(4, 15);
   u8g2.begin();
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 10, "Listening to MEMO...");
+  u8g2.drawStr(0, 10, "Connecting to WiFi...");
   u8g2.sendBuffer();
 
-  // Wait a moment for serial to initialize
-  delay(1000);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(); // Clear any old cached connections
+  delay(100);
+
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+    
+    // Timeout and reboot if it fails to connect after 15 seconds
+    if (attempts > 30) {
+      Serial.println("\nWiFi failed! Rebooting...");
+      u8g2.clearBuffer();
+      u8g2.drawStr(0, 10, "WiFi Failed.");
+      u8g2.drawStr(0, 30, "Rebooting ESP32...");
+      u8g2.sendBuffer();
+      delay(2000);
+      ESP.restart();
+    }
+  }
+
+  Serial.println("\nWiFi connected.");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 10, ("IP: " + WiFi.localIP().toString()).c_str());
+  u8g2.drawStr(0, 30, "Connecting to Python");
+  u8g2.sendBuffer();
 
   const i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -73,11 +112,26 @@ void setup() {
 }
 
 void loop() {
-  // Check if Python sent any text to display
-  if (Serial.available()) {
-    String text = Serial.readStringUntil('\n');
+  // If not connected to the Python server, try connecting
+  if (!client.connected()) {
+    Serial.println("Reconnecting to Python server...");
+    showText("Connecting to " + String(host) + "...");
+    
+    if (client.connect(host, port)) {
+      Serial.println("Connected to Python Server!");
+      showText("Connected! Speak.");
+    } else {
+      delay(2000); // Wait 2 seconds before retrying
+      return;
+    }
+  }
+
+  // Check if Python sent any text to display back to us!
+  if (client.available()) {
+    String text = client.readStringUntil('\n');
     text.trim();
     if (text.length() > 0) {
+      Serial.println("Received: " + text);
       showText(text);
     }
   }
@@ -88,7 +142,7 @@ void loop() {
   
   esp_err_t result = i2s_read(I2S_PORT, &wave, sizeof(wave), &bytesIn, portMAX_DELAY);
   
-  if (result == ESP_OK && bytesIn > 0) {
+  if (result == ESP_OK && bytesIn > 0 && client.connected()) {
     int samples_read = bytesIn / sizeof(wave[0]);
     int16_t out_wave[512];
     
@@ -104,7 +158,7 @@ void loop() {
       out_wave[i] = (int16_t)sample; 
     }
 
-    // Write raw binary bytes straight to the Serial port
-    Serial.write((uint8_t*)out_wave, samples_read * sizeof(int16_t));
+    // Write raw binary bytes over the TCP Wi-Fi connection
+    client.write((uint8_t*)out_wave, samples_read * sizeof(int16_t));
   }
 }
