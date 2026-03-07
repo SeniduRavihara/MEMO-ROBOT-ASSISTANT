@@ -4,13 +4,12 @@
 #include <U8g2lib.h>
 
 // --- WIFI CONFIGURATION ---
-const char* ssid = "4G-Senidu";
-const char* password = "1234567890";
+const char* ssid = "Xperia XZ2";
+const char* password = "senu1234";
 
-// --- PYTHON SERVER IP ---
-const char* host = "192.168.100.243"; // Your computer's IP address
+// --- TCP SERVER CONFIG ---
 const uint16_t port = 8002;
-
+WiFiServer server(port);
 WiFiClient client;
 
 // I2S Microphone Pins (INMP441)
@@ -20,9 +19,9 @@ WiFiClient client;
 #define I2S_PORT I2S_NUM_0
 
 // Audio settings
-#define SAMPLE_RATE 16000 // 16kHz is standard for voice transcription
+#define SAMPLE_RATE 16000
 #define MIC_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_32BIT
-#define MIC_GAIN 8 // Artificial volume multiplier for distant speech
+#define MIC_GAIN 8
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
@@ -30,7 +29,6 @@ void showText(String text) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
   
-  // Basic text wrapping (max 21 chars per line)
   int y = 10;
   int startIdx = 0;
   while (startIdx < text.length()) {
@@ -38,9 +36,8 @@ void showText(String text) {
     u8g2.drawStr(0, y, line.c_str());
     y += 12;
     startIdx += 21;
-    if (y > 60) break; // Screen full
+    if (y > 60) break; 
   }
-  
   u8g2.sendBuffer();
 }
 
@@ -51,11 +48,11 @@ void setup() {
   u8g2.begin();
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 10, "Connecting to WiFi...");
+  u8g2.drawStr(0, 10, "Robot Loading...");
   u8g2.sendBuffer();
 
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect(); // Clear any old cached connections
+  WiFi.disconnect(); 
   delay(100);
 
   WiFi.begin(ssid, password);
@@ -65,26 +62,24 @@ void setup() {
     delay(500);
     Serial.print(".");
     attempts++;
-    
-    // Timeout and reboot if it fails to connect after 15 seconds
     if (attempts > 30) {
-      Serial.println("\nWiFi failed! Rebooting...");
-      u8g2.clearBuffer();
-      u8g2.drawStr(0, 10, "WiFi Failed.");
-      u8g2.drawStr(0, 30, "Rebooting ESP32...");
-      u8g2.sendBuffer();
+      showText("WiFi Failed. Rebooting...");
       delay(2000);
       ESP.restart();
     }
   }
 
+  server.begin();
+
   Serial.println("\nWiFi connected.");
-  Serial.println("IP address: ");
+  Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
   u8g2.clearBuffer();
-  u8g2.drawStr(0, 10, ("IP: " + WiFi.localIP().toString()).c_str());
-  u8g2.drawStr(0, 30, "Connecting to Python");
+  u8g2.drawStr(0, 10, "ROBOT ONLINE");
+  u8g2.drawStr(0, 25, ("IP: " + WiFi.localIP().toString()).c_str());
+  u8g2.drawStr(0, 40, "Port: 8002");
+  u8g2.drawStr(0, 55, "Waiting for PC...");
   u8g2.sendBuffer();
 
   const i2s_config_t i2s_config = {
@@ -112,53 +107,40 @@ void setup() {
 }
 
 void loop() {
-  // If not connected to the Python server, try connecting
   if (!client.connected()) {
-    Serial.println("Reconnecting to Python server...");
-    showText("Connecting to " + String(host) + "...");
-    
-    if (client.connect(host, port)) {
-      Serial.println("Connected to Python Server!");
-      showText("Connected! Speak.");
-    } else {
-      delay(2000); // Wait 2 seconds before retrying
-      return;
+    client = server.available();
+    if (client) {
+      Serial.println("PC Connected!");
+      showText("AI Robot Active! Speak now...");
     }
   }
 
-  // Check if Python sent any text to display back to us!
-  if (client.available()) {
-    String text = client.readStringUntil('\n');
-    text.trim();
-    if (text.length() > 0) {
-      Serial.println("Received: " + text);
-      showText(text);
+  if (client.connected()) {
+    // Check if PC/Gemini sent any text talk back
+    if (client.available()) {
+      String text = client.readStringUntil('\n');
+      text.trim();
+      if (text.length() > 0) {
+        Serial.println("Gemini: " + text);
+        showText(text);
+      }
     }
-  }
 
-  size_t bytesIn = 0;
-  // A chunk of 512 samples
-  int32_t wave[512]; 
-  
-  esp_err_t result = i2s_read(I2S_PORT, &wave, sizeof(wave), &bytesIn, portMAX_DELAY);
-  
-  if (result == ESP_OK && bytesIn > 0 && client.connected()) {
-    int samples_read = bytesIn / sizeof(wave[0]);
-    int16_t out_wave[512];
+    // Read mic and stream to PC
+    size_t bytesIn = 0;
+    int32_t wave[512]; 
+    esp_err_t result = i2s_read(I2S_PORT, &wave, sizeof(wave), &bytesIn, 0); // Non-blocking
     
-    // Shift 24-bit data inside 32-bit frame to 16-bit, then apply software gain
-    for (int i = 0; i < samples_read; ++i) {
-      int32_t sample = wave[i] >> 16;
-      sample = sample * MIC_GAIN;
-      
-      // Clamp to 16-bit boundaries to prevent distortion/wrapping
-      if (sample > 32767) sample = 32767;
-      if (sample < -32768) sample = -32768;
-      
-      out_wave[i] = (int16_t)sample; 
+    if (result == ESP_OK && bytesIn > 0) {
+      int samples_read = bytesIn / sizeof(wave[0]);
+      int16_t out_wave[512];
+      for (int i = 0; i < samples_read; ++i) {
+        int32_t sample = (wave[i] >> 16) * MIC_GAIN;
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        out_wave[i] = (int16_t)sample; 
+      }
+      client.write((uint8_t*)out_wave, samples_read * sizeof(int16_t));
     }
-
-    // Write raw binary bytes over the TCP Wi-Fi connection
-    client.write((uint8_t*)out_wave, samples_read * sizeof(int16_t));
   }
 }
