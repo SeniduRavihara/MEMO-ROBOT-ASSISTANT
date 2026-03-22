@@ -141,8 +141,7 @@ void loop() {
            } else { delay(1); }
         }
         showText("FINISHED", "PC Waiting...");
-        client.stop();
-        delay(3000); // Wait 3s before allowing next play
+        // client.stop(); // KEEP THE CONNECTION OPEN for more messages
       }
   }
 }
