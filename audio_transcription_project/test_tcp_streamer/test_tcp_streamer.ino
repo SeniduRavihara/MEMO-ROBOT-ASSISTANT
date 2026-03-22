@@ -5,8 +5,8 @@
 #include <U8g2lib.h>
 
 // --- WIFI CONFIGURATION ---
-const char* ssid = "4G-Senidu";
-const char* password = "1234567890";
+const char* ssid = "Xperia XZ2";
+const char* password = "senidu1234";
 
 // --- TCP SERVER CONFIG ---
 const uint16_t port = 8003; // Using 8003 to isolate from main project

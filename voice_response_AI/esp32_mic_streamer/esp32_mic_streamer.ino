@@ -4,8 +4,8 @@
 #include <U8g2lib.h>
 
 // --- WIFI CONFIGURATION ---
-const char* ssid = "4G-Senidu";
-const char* password = "1234567890";
+const char* ssid = "Xperia XZ2";
+const char* password = "senidu1234";
 
 // --- TCP SERVER CONFIG ---
 const uint16_t port = 8005;
@@ -177,13 +177,9 @@ void setup() {
     .data_out_num = I2S_SPK_DOUT,
     .data_in_num = I2S_PIN_NO_CHANGE
   };
-
-  if (i2s_driver_install(I2S_SPK_PORT, &spk_i2s_config, 0, NULL) != ESP_OK) {
-    showText("Spk I2S Install Fail");
-    return;
-  }
-  i2s_set_pin(I2S_SPK_PORT, &spk_pin_config);
-  i2s_start(I2S_SPK_PORT);
+    i2s_driver_install(I2S_SPK_PORT, &spk_i2s_config, 0, NULL);
+    i2s_set_pin(I2S_SPK_PORT, &spk_pin_config);
+    i2s_start(I2S_SPK_PORT);
 
   Serial.println("Setup Complete - Server Listening...");
   u8g2.clearBuffer();
