@@ -1,4 +1,4 @@
-// ROBOT AI ASSISTANT: PORT 0 MASTER SWITCH (MAX COMPATIBILITY)
+// ROBOT AI ASSISTANT: PORT 0 MASTER SWITCH (SMOOTH OPTIMIZED)
 #include <driver/i2s.h>
 #include <WiFi.h>
 #include <Wire.h>
@@ -52,10 +52,15 @@ void showText(String t1, String t2 = "", String t3 = "") {
   u8g2.sendBuffer();
 }
 
-// --- HARDWARE SWITCHER ---
+// --- OPTIMIZED HARDWARE SWITCHER ---
 void startMicHardware() {
   if (isMicActive) return;
-  if (isSpkActive) { i2s_stop(I2S_PORT); i2s_driver_uninstall(I2S_PORT); isSpkActive = false; }
+  if (isSpkActive) { 
+    i2s_stop(I2S_PORT); 
+    i2s_driver_uninstall(I2S_PORT); 
+    isSpkActive = false; 
+    vTaskDelay(50 / portTICK_PERIOD_MS); // Hardware Breath
+  }
   
   const i2s_config_t cfg = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
@@ -64,7 +69,7 @@ void startMicHardware() {
     .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count        = 8,
+    .dma_buf_count        = 12, // Increased for stability
     .dma_buf_len          = 1024,
     .use_apll             = false
   };
@@ -73,12 +78,17 @@ void startMicHardware() {
   i2s_set_pin(I2S_PORT, &pins);
   i2s_start(I2S_PORT);
   isMicActive = true;
-  Serial.println("[HW] Mic Active on Port 0");
+  Serial.println("[HW] Mic On P0");
 }
 
 void startSpkHardware() {
   if (isSpkActive) return;
-  if (isMicActive) { i2s_stop(I2S_PORT); i2s_driver_uninstall(I2S_PORT); isMicActive = false; }
+  if (isMicActive) { 
+    i2s_stop(I2S_PORT); 
+    i2s_driver_uninstall(I2S_PORT); 
+    isMicActive = false; 
+    vTaskDelay(50 / portTICK_PERIOD_MS); // Hardware Breath
+  }
 
   const i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -86,10 +96,10 @@ void startSpkHardware() {
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 1024,
-    .use_apll = false,
+    .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count        = 12, // Increased for stability
+    .dma_buf_len          = 1024,
+    .use_apll             = false,
     .tx_desc_auto_clear = true
   };
   i2s_driver_install(I2S_PORT, &cfg, 0, NULL);
@@ -97,7 +107,7 @@ void startSpkHardware() {
   i2s_set_pin(I2S_PORT, &pins);
   i2s_start(I2S_PORT);
   isSpkActive = true;
-  Serial.println("[HW] Speaker Active on Port 0");
+  Serial.println("[HW] Spk On P0");
 }
 
 // --- TASK 1: NETWORK HANDLER (Core 0) ---
@@ -109,10 +119,12 @@ void networkTask(void *pvParameters) {
       } else { vTaskDelay(2000 / portTICK_PERIOD_MS); continue; }
     }
 
-    // 1. Send Mic Data (If HW is in Mic Mode)
+    // 1. Send Mic Data (Streaming if allowed)
     AudioChunk micChunk;
     if (xQueueReceive(micQueue, &micChunk, 0) == pdTRUE) {
-      if (client.connected()) client.write(micChunk.data, micChunk.len);
+      if (client.connected()) {
+        client.write(micChunk.data, micChunk.len);
+      }
     }
 
     // 2. Receive Speaker Data
@@ -122,7 +134,7 @@ void networkTask(void *pvParameters) {
 
       if (strcmp(header, "AUDIO") == 0) {
         isRobotSpeaking = true;
-        xQueueReset(micQueue); 
+        xQueueReset(micQueue); // Flush old mic data immediately
         
         uint8_t len_buf[4];
         while (client.connected() && client.available() < 4) { vTaskDelay(1); }
@@ -152,33 +164,31 @@ void networkTask(void *pvParameters) {
 
 // --- TASK 2: AUDIO ENGINE (Core 1) ---
 void audioEngineTask(void *pvParameters) {
-  int16_t mic_buf[512]; 
+  int16_t mic_buf_raw[512]; 
   size_t bytesIn;
 
   while (true) {
     if (isRobotSpeaking) {
-      // SPEAKER MODE
       startSpkHardware();
       AudioChunk spkChunk;
       if (xQueueReceive(spkQueue, &spkChunk, 0) == pdTRUE) {
         size_t bw;
         i2s_write(I2S_PORT, spkChunk.data, spkChunk.len, &bw, portMAX_DELAY);
         if (uxQueueMessagesWaiting(spkQueue) == 0) {
-          vTaskDelay(300 / portTICK_PERIOD_MS);
+          vTaskDelay(400 / portTICK_PERIOD_MS); // End-of-speech gap
           isRobotSpeaking = false;
         }
       }
     } else {
-      // MIC MODE
       startMicHardware();
-      if (i2s_read(I2S_PORT, mic_buf, sizeof(mic_buf), &bytesIn, 0) == ESP_OK && bytesIn > 0) {
+      if (i2s_read(I2S_PORT, mic_buf_raw, sizeof(mic_buf_raw), &bytesIn, 0) == ESP_OK && bytesIn > 0) {
         int samples = bytesIn / 2;
         for (int i = 0; i < samples; i++) {
-          int32_t val = (int32_t)mic_buf[i] * MIC_GAIN;
-          mic_buf[i] = (val > 32767) ? 32767 : (val < -32768) ? -32768 : (int16_t)val;
+          int32_t val = (int32_t)mic_buf_raw[i] * MIC_GAIN;
+          mic_buf_raw[i] = (val > 32767) ? 32767 : (val < -32768) ? -32768 : (int16_t)val;
         }
         AudioChunk micChunk; micChunk.len = bytesIn;
-        memcpy(micChunk.data, mic_buf, bytesIn);
+        memcpy(micChunk.data, mic_buf_raw, bytesIn);
         xQueueSend(micQueue, &micChunk, 0); 
       }
     }
@@ -190,7 +200,7 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(4, 15);
   u8g2.begin();
-  showText("MASTER SWITCH BOOT", "Initializing Queues...");
+  showText("OPTIMIZED SWITCH", "Smoothing Hardware Transitions...");
 
   micQueue = xQueueCreate(10, sizeof(AudioChunk));
   spkQueue = xQueueCreate(20, sizeof(AudioChunk));
@@ -201,14 +211,14 @@ void setup() {
   xTaskCreatePinnedToCore(networkTask, "NetTask", 8192, NULL, 5, NULL, 0); 
   xTaskCreatePinnedToCore(audioEngineTask, "AudioTask", 8192, NULL, 10, NULL, 1); 
 
-  showText("MASTER READY", WiFi.localIP().toString(), "Everything on P0");
+  showText("STABLE READY", WiFi.localIP().toString(), "Optimized Switch");
 }
 
 void loop() {
   static uint32_t lastUpd = 0;
   if (millis() - lastUpd > 1000) {
     if (client.connected()) {
-      showText(isRobotSpeaking ? "AI SPEAKING..." : "== LISTENING ==", isRobotSpeaking ? "Spk Active" : "Mic Active", "Shared Port 0");
+      showText(isRobotSpeaking ? "AI: SPEAKING" : "YOU: LISTENING", isRobotSpeaking ? "Hw Speaker" : "Hw Microphone", "Buffered Core 1");
     } else {
       showText("OFFLINE", ssid);
     }
