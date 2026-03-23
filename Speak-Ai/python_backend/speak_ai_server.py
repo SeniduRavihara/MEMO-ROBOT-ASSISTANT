@@ -2,7 +2,7 @@ import os
 import time
 import socket
 import struct
-import shutil
+import io
 import asyncio
 import speech_recognition as sr
 from pydub import AudioSegment
@@ -12,177 +12,150 @@ import edge_tts
 
 # --- CONFIGURATION ---
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not set!")
+API_KEY = os.getenv("GEMINI_API_KEY")
+client_ai = genai.Client(api_key=API_KEY)
 
-# Initialize the NEW Gemini Client
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Port 8006: PC is SERVER (Robot connects here for Speaker/Text)
+# Port 8005: Robot is SERVER (PC connects here for Mic)
+PC_SPK_PORT = 8006
+ROBOT_MIC_PORT = 8005
 
-# Audio settings
+# Audio processing
 SAMPLE_RATE = 16000
-SILENCE_THRESHOLD = 500  # RMS threshold
-SILENCE_DURATION = 1.0   # Seconds of silence before processing
+RMS_THRESHOLD = 500  # Voice detection sensitivity
 
-# --- UTILS ---
+def get_rms(data):
+    n = len(data) // 2
+    if n == 0: return 0
+    samples = struct.unpack(f"<{n}h", data)
+    return int((sum(s*s for s in samples) / n) ** 0.5)
 
-def calculate_rms(audio_bytes):
-    count = len(audio_bytes) // 2
-    if count == 0: return 0
-    shorts = struct.unpack(f"<{count}h", audio_bytes)
-    sum_squares = sum(s*s for s in shorts)
-    return int((sum_squares / count)**0.5)
+async def tts_to_pcm(text):
+    """Generate 16-bit Stereo PCM for the Robot (Port 8006 pattern)."""
+    communicate = edge_tts.Communicate(text, "en-US-GuyNeural")
+    buf = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
+    buf.seek(0)
+    audio = AudioSegment.from_mp3(buf)
+    # Match the working simple_tts_test: 16kHz, Stereo, 16-bit
+    audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(2).set_sample_width(2)
+    return (audio + 12).raw_data  # Boost volume 12dB
 
-async def generate_speech_pcm(text):
-    """Generate 16kHz 16-bit Stereo PCM for the Robot"""
-    try:
-        communicate = edge_tts.Communicate(text, "en-US-GuyNeural")
-        temp_mp3 = "temp_speech.mp3"
-        await communicate.save(temp_mp3)
-        
-        audio = AudioSegment.from_mp3(temp_mp3)
-        audio = audio.set_frame_rate(16000).set_channels(2).set_sample_width(2)
-        
-        # Volume Boost for Robot Speaker
-        audio = audio + 10 
-        
-        pcm_data = audio.raw_data
-        if os.path.exists(temp_mp3): os.remove(temp_mp3)
-        return pcm_data
-    except Exception as e:
-        print(f"[TTS Error] {e}")
-        return b''
-
-def ask_gemini(prompt):
-    """Try to get response from Gemini, or return a friendly error message."""
-    # List of models to try (some environments have different names)
-    models = ['gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-2.0-flash-exp']
-    for model_name in models:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            if response and response.text:
-                return response.text
-        except Exception:
-            continue
-            
-    # If all models fail, return a fallback message
-    return "I am sorry, my AI brain is currently unavailable. Please check my API key."
-
-# --- MAIN ENGINE ---
-
-async def robot_engine():
+async def main():
     print("\n" + "="*42)
-    print("SPEAK-AI ENGINE (PROVEN MODE)")
+    print("SPEAK-AI ENGINE — HYBRID DUAL-PIPE MODE")
     print("="*42)
-
-    robot_ip = input("\nEnter Robot IP (from OLED): ").strip()
-    if not robot_ip: return
-
-    print(f"\n[CLIENT] Connecting to {robot_ip}:8006...")
     
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect((robot_ip, 8006))
-        sock.settimeout(0.1) 
-        print("[CLIENT] Connected! Start speaking to the Robot.")
-    except Exception as e:
-        print(f"[ERROR] Connection failed: {e}")
-        return
+    # 1. Start Speaker Server (Port 8006) - PC WAITS FOR ROBOT
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", PC_SPK_PORT))
+    server_sock.listen(1)
+    
+    print(f"\n[STEP 1] Listening on Port {PC_SPK_PORT} (SPK)...")
+    print("        (Robot will find you automatically)")
+    
+    spk_conn, addr = server_sock.accept()
+    robot_ip = addr[0]
+    print(f"[OK] Speaker pipe connected from Robot at {robot_ip}")
 
-    audio_buffer = bytearray()
-    last_sound_time = time.time()
-    is_processing = False
-
-    while True:
+    # 2. Connect to Robot Mic (Port 8005) - PC CONNECTS TO ROBOT
+    print(f"\n[STEP 2] Connecting to Robot Mic at {robot_ip}:{ROBOT_MIC_PORT}...")
+    mic_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    
+    # Retry connection a few times if robot is still booting
+    for i in range(5):
         try:
-            # 1. READ MIC DATA FROM ROBOT
-            try:
-                data = sock.recv(2048) # Larger recv
-                if not data: break
-                
-                rms = calculate_rms(data)
-                
-                if rms > SILENCE_THRESHOLD:
-                    if not is_processing: 
-                        print(" [HEARING]", end="\r")
-                    audio_buffer.extend(data)
-                    last_sound_time = time.time()
-                    is_processing = True
-                
-                if is_processing and (time.time() - last_sound_time > SILENCE_DURATION):
-                    print(f"\n[SERVER] Processing {len(audio_buffer)} bytes...")
-                    
-                    # Save temporary WAV for STT
-                    temp_wav = "temp_input.wav"
-                    audio_seg = AudioSegment(
-                        data=bytes(audio_buffer),
-                        sample_width=2,
-                        frame_rate=16000,
-                        channels=1
-                    )
-                    audio_seg.export(temp_wav, format="wav")
-                    
-                    # 2. TRANSCRIBE
-                    r = sr.Recognizer()
-                    with sr.AudioFile(temp_wav) as source:
-                        audio_data = r.record(source)
-                        try:
-                            user_text = r.recognize_google(audio_data)
-                            print(f"User: {user_text}")
-                            
-                            # 3. ASK GEMINI
-                            ai_text = ask_gemini(user_text)
-                            print(f"AI: {ai_text}")
-                            
-                            # 4. SEND TEXT TO OLED
-                            clean_text = ai_text.replace('\n', ' ').strip()
-                            sock.settimeout(30.0) # HEAVY TIMEOUT FOR LARGE AUDIO
-                            sock.sendall(f"TEXT:{clean_text}\n".encode('utf-8'))
-                            
-                            # 5. SEND AUDIO TO SPEAKER
-                            print("[SERVER] Synthesizing speech...")
-                            pcm = await generate_speech_pcm(clean_text)
-                            if pcm:
-                                sock.sendall(b'AUDIO' + struct.pack('>I', len(pcm)))
-                                sock.sendall(pcm)
-                                print("[SERVER] Finished playback.")
-                            else:
-                                print("[SERVER] Speech generation failed.")
-
-                            sock.settimeout(0.1) # Back to fast recv
-
-                        except sr.UnknownValueError:
-                            print("[SERVER] Could not understand audio.")
-                        except Exception as inner_e:
-                            print(f"[ERROR during processing] {inner_e}")
-                            sock.settimeout(0.1)
-                    
-                    # Reset buffer
-                    audio_buffer = bytearray()
-                    is_processing = False
-                    print(" [Mic Level: 0]", end="\r")
-
-            except socket.timeout:
-                pass
-            except socket.error:
-                pass
-            
-            await asyncio.sleep(0.01)
-
-        except KeyboardInterrupt:
+            mic_sock.connect((robot_ip, ROBOT_MIC_PORT))
+            print("[OK] Microphone pipe connected.")
             break
         except Exception as e:
-            print(f"\n[FATAL ERROR] {e}")
+            print(f"      Retry {i+1}/5...")
+            time.sleep(2)
+    else:
+        print("[ERROR] Could not connect to Robot Mic.")
+        return
+
+    # 3. Start Processing Loop
+    recognizer = sr.Recognizer()
+    print("\n[READY] Start speaking to the Robot! 🎤🤖")
+    
+    while True:
+        try:
+            print("\n" + "-"*30)
+            print(" [LISTENING]...")
+            audio_buffer = io.BytesIO()
+            silence_start = None
+            voice_detected = False
+            start_time = time.time()
+
+            # Buffer audio until silence
+            while True:
+                data = mic_sock.recv(2048)
+                if not data: break
+                
+                audio_buffer.write(data)
+                rms = get_rms(data)
+                
+                if rms > RMS_THRESHOLD:
+                    voice_detected = True
+                    silence_start = None
+                elif voice_detected:
+                    if silence_start is None: silence_start = time.time()
+                    if time.time() - silence_start > 1.2: break # 1.2s silence
+                
+                # Max 10s recording
+                if time.time() - start_time > 10: break
+
+            if not voice_detected:
+                continue
+
+            # Process Speech
+            audio_buffer.seek(0)
+            raw_audio = audio_buffer.read()
+            print(f"[SERVER] Captured {len(raw_audio)} bytes. Processing...")
+            
+            audio_data = sr.AudioData(raw_audio, SAMPLE_RATE, 2)
+            try:
+                user_text = recognizer.recognize_google(audio_data)
+                print(f"User: {user_text}")
+            except Exception:
+                print("[SERVER] Could not understand audio.")
+                continue
+
+            # Get AI Response
+            try:
+                response = client_ai.models.generate_content(
+                    model="gemini-2.0-flash-exp", # Use high-speed experimental model
+                    contents=user_text
+                )
+                ai_reply = response.text.strip()
+                print(f"AI: {ai_reply}")
+            except Exception as e:
+                print(f"[AI ERROR] {e}")
+                ai_reply = "I am sorry, my AI brain is acting up."
+
+            # Send back to Robot (Text + Audio)
+            # a) Send TEXT to OLED
+            spk_conn.sendall(f"TEXT:{ai_reply}\n".encode())
+            
+            # b) Send AUDIO to Speaker
+            print("[SERVER] Synthesizing speech...")
+            pcm_data = await tts_to_pcm(ai_reply)
+            header = b"AUDIO" + struct.pack(">I", len(pcm_data))
+            spk_conn.sendall(header)
+            spk_conn.sendall(pcm_data)
+            print("[SERVER] Playback finished.")
+
+        except Exception as e:
+            print(f"[CRITICAL ERROR] {e}")
             break
 
-    sock.close()
+    mic_sock.close()
+    spk_conn.close()
+    server_sock.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(robot_engine())
-    except KeyboardInterrupt:
-        print("\n[SERVER] Stopped.")
+    asyncio.run(main())

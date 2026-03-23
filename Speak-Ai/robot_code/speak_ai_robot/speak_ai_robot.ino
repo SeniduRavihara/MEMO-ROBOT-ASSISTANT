@@ -3,131 +3,83 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 
-// --- WIFI CONFIGURATION ---
+// --- FINAL CONFIG (DUAL-PIPE) ---
 const char* ssid = "Xperia XZ2";
 const char* password = "senidu1234";
 
-// --- TCP SERVER CONFIG ---
-const uint16_t port = 8006;
-WiFiServer server(port);
-WiFiClient client;
+// Architecture:
+// 1. Mic: Robot is Server (8005) -> PC connects here
+// 2. Speaker: PC is Server (8006) -> Robot connects here
+const uint16_t MIC_PORT = 8005;
+const uint16_t SPK_PORT = 8006;
 
-// I2S Microphone Pins (INMP441)
-#define I2S_WS GPIO_NUM_25
-#define I2S_SD GPIO_NUM_32
-#define I2S_SCK GPIO_NUM_26
+WiFiServer micServer(MIC_PORT);
+WiFiClient micClient;
+WiFiClient spkClient;
+String pc_ip = ""; // Found by scanner
+
+// I2S Microphone (INMP441) - Port 0
+#define I2S_WS  25
+#define I2S_SD  32
+#define I2S_SCK 26
 #define I2S_PORT I2S_NUM_0
 
-// I2S Speaker Pins (MAX98357)
-#define I2S_SPK_BCLK GPIO_NUM_14
-#define I2S_SPK_LRC GPIO_NUM_27
-#define I2S_SPK_DOUT GPIO_NUM_33
+// I2S Speaker (MAX98357) - Port 1
+#define I2S_SPK_BCLK 14
+#define I2S_SPK_LRC  27
+#define I2S_SPK_DOUT 33
 #define I2S_SPK_PORT I2S_NUM_1
 
-// Audio settings
 #define SAMPLE_RATE 16000
-#define MIC_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_16BIT
-#define MIC_GAIN 4
+#define MIC_GAIN    4
 
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
-
-// Flag to pause mic streaming while speaker is active
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 volatile bool isSpeaking = false;
 
-void showText(String text) {
+void oled(String l1, String l2="", String l3="", String l4="") {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
-  
-  int y = 10;
-  int startIdx = 0;
-  while (startIdx < text.length()) {
-    String line = text.substring(startIdx, startIdx + 21);
-    u8g2.drawStr(0, y, line.c_str());
-    y += 12;
-    startIdx += 21;
-    if (y > 60) break; 
-  }
+  u8g2.drawStr(0, 12, l1.c_str());
+  u8g2.drawStr(0, 26, l2.c_str());
+  u8g2.drawStr(0, 40, l3.c_str());
+  u8g2.drawStr(0, 54, l4.c_str());
   u8g2.sendBuffer();
 }
 
-void playTone(float frequency, float durationSec, float volume) {
-  int num_samples = int(SAMPLE_RATE * durationSec);
-  // Allocate buffer for 16-bit stereo (2 channels)
-  int16_t *buffer = (int16_t*)malloc(num_samples * 2 * sizeof(int16_t));
-  if (buffer == NULL) return;
-
-  float amplitude = volume * 32767.0f;
-  for (int i = 0; i < num_samples; i++) {
-    float t = (float)i / SAMPLE_RATE;
-    int16_t sample = (int16_t)(amplitude * sin(2.0f * PI * frequency * t));
-    buffer[2 * i] = sample;     // Left Channel
-    buffer[2 * i + 1] = sample; // Right Channel
+// --- MIC SERVER TASK (Core 0) ---
+void micTask(void* param) {
+  static int16_t wave[512];
+  while(true) {
+    if (micClient.connected() && !isSpeaking) {
+      size_t bytesIn = 0;
+      // 16-bit read from voice_response_AI (proven working)
+      if (i2s_read(I2S_PORT, &wave, sizeof(wave), &bytesIn, 0) == ESP_OK && bytesIn > 0) {
+        int samples = bytesIn / 2;
+        for (int i = 0; i < samples; i++) {
+          int32_t s = (int32_t)wave[i] * MIC_GAIN;
+          if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+          wave[i] = (int16_t)s;
+        }
+        micClient.write((uint8_t*)wave, bytesIn);
+      }
+    } else {
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
   }
-
-  size_t bytes_written;
-  i2s_write(I2S_SPK_PORT, buffer, num_samples * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-  free(buffer);
-}
-
-void playBeep() {
-  isSpeaking = true;
-  playTone(523, 0.15, 0.5);  // C5
-  delay(150);
-  playTone(659, 0.15, 0.5);  // E5
-  delay(150);
-  playTone(784, 0.15, 0.5);  // G5
-  isSpeaking = false;
 }
 
 void setup() {
   Serial.begin(115200);
   Wire.begin(4, 15);
   u8g2.begin();
-  showText("Robot Starting...");
+  oled("BOOTING...", "Dual-Pipe Ready");
 
-  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nIP: " + WiFi.localIP().toString());
 
-  server.begin();
-  Serial.println("\nWiFi connected.");
-  Serial.println(WiFi.localIP());
-
-  u8g2.clearBuffer();
-  u8g2.drawStr(0, 10, "ROBOT ONLINE");
-  u8g2.drawStr(0, 25, ("IP: " + WiFi.localIP().toString()).c_str());
-  u8g2.drawStr(0, 40, ("Port: " + String(port)).c_str());
-  u8g2.drawStr(0, 55, "WAITING FOR PC...");
-  u8g2.sendBuffer();
-
-  const i2s_config_t i2s_config = {
-    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-    .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = MIC_BITS_PER_SAMPLE,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 8,
-    .dma_buf_len = 1024,
-    .use_apll = false
-  };
-
-  const i2s_pin_config_t pin_config = {
-    .bck_io_num = I2S_SCK,
-    .ws_io_num = I2S_WS,
-    .data_out_num = I2S_PIN_NO_CHANGE,
-    .data_in_num = I2S_SD
-  };
-
-  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-  i2s_set_pin(I2S_PORT, &pin_config);
-  i2s_start(I2S_PORT);
-
-  const i2s_config_t spk_i2s_config = {
+  // Init Speaker (Port 1) - simple_tts_test config
+  const i2s_config_t spk_cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate = SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
@@ -139,83 +91,97 @@ void setup() {
     .use_apll = false,
     .tx_desc_auto_clear = true
   };
+  i2s_driver_install(I2S_SPK_PORT, &spk_cfg, 0, NULL);
+  const i2s_pin_config_t spk_pins = {I2S_SPK_BCLK, I2S_SPK_LRC, I2S_SPK_DOUT, I2S_PIN_NO_CHANGE};
+  i2s_set_pin(I2S_SPK_PORT, &spk_pins);
+  i2s_start(I2S_SPK_PORT);
 
-  const i2s_pin_config_t spk_pin_config = {
-    .bck_io_num = I2S_SPK_BCLK,
-    .ws_io_num = I2S_SPK_LRC,
-    .data_out_num = I2S_SPK_DOUT,
-    .data_in_num = I2S_PIN_NO_CHANGE
+  // Init Mic (Port 0) - voice_response_AI config
+  const i2s_config_t mic_cfg = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false
   };
-    i2s_driver_install(I2S_SPK_PORT, &spk_i2s_config, 0, NULL);
-    i2s_set_pin(I2S_SPK_PORT, &spk_pin_config);
-    i2s_start(I2S_SPK_PORT);
+  const i2s_pin_config_t mic_pins = {I2S_SCK, I2S_WS, I2S_PIN_NO_CHANGE, I2S_SD};
+  i2s_driver_install(I2S_PORT, &mic_cfg, 0, NULL);
+  i2s_set_pin(I2S_PORT, &mic_pins);
+  i2s_start(I2S_PORT);
+
+  micServer.begin();
+  xTaskCreatePinnedToCore(micTask, "MicTask", 8192, NULL, 1, NULL, 0);
+  
+  oled("ROBOT ONLINE", WiFi.localIP().toString(), "Mic:8005 (Server)", "Spk:8006 (Scanner)");
+}
+
+void scanSubnet() {
+  IPAddress local = WiFi.localIP();
+  String base = String(local[0]) + "." + String(local[1]) + "." + String(local[2]) + ".";
+  for (int i = 2; i < 255; i++) {
+    if (i == local[3]) continue;
+    String test = base + String(i);
+    if (spkClient.connect(test.c_str(), SPK_PORT, 20)) {
+      pc_ip = test;
+      return;
+    }
+    if (i % 20 == 0) oled("SCANNING SPK...", "Trying: " + test);
+  }
 }
 
 void loop() {
-  if (!client.connected()) {
-    client = server.available();
-    if (client) {
-      Serial.println("PC Connected!");
-      showText("AI Robot Active! Speak now...");
+  // Mic Client (Incoming)
+  if (!micClient.connected()) {
+    WiFiClient newC = micServer.available();
+    if (newC) { micClient = newC; Serial.println("Mic connected"); }
+  }
+
+  // Spk Client (Outgoing)
+  if (!spkClient.connected()) {
+    if (pc_ip == "") scanSubnet();
+    else {
+      if (!spkClient.connect(pc_ip.c_str(), SPK_PORT)) { pc_ip = ""; delay(1000); }
+      else Serial.println("Spk connected");
     }
   }
 
-  if (client.connected()) {
-    if (client.available() >= 5) {
-      char header_peek[6];
-      client.readBytes(header_peek, 5);
-      header_peek[5] = '\0';
+  // Handle Audio/Text from PC (via Spk Pipe)
+  if (spkClient.connected() && spkClient.available() >= 5) {
+    char head[6]; spkClient.readBytes(head, 5); head[5] = '\0';
+    if (strcmp(head, "TEXT:") == 0) {
+      String msg = spkClient.readStringUntil('\n'); msg.trim();
+      oled("AI SAYS:", msg);
+    } 
+    else if (strcmp(head, "AUDIO") == 0) {
+      isSpeaking = true;
+      uint8_t len_b[4]; while(spkClient.available()<4) delay(1); spkClient.readBytes(len_b, 4);
+      uint32_t alen = ((uint32_t)len_b[0]<<24)|((uint32_t)len_b[1]<<16)|((uint32_t)len_b[2]<<8)|len_b[3];
       
-      if (strcmp(header_peek, "TEXT:") == 0) {
-        String text = client.readStringUntil('\n');
-        text.trim();
-        showText(text);
-        playBeep();
-      } 
-      else if (strcmp(header_peek, "AUDIO") == 0) {
-        uint8_t len_buf[4];
-        while (client.connected() && client.available() < 4) { delay(1); } 
-        client.readBytes(len_buf, 4);
-        uint32_t audio_len = ((uint32_t)len_buf[0] << 24) | ((uint32_t)len_buf[1] << 16) | ((uint32_t)len_buf[2] << 8) | (uint32_t)len_buf[3];
-        
-        uint32_t total_received = 0;
-        uint8_t audio_buf[1024];
-        while (total_received < audio_len && client.connected()) {
-           int available_now = client.available();
-           if (available_now > 0) {
-             int to_read = min((uint32_t)available_now, audio_len - total_received);
-             to_read = min((uint32_t)1024, (uint32_t)to_read);
-             to_read = (to_read / 4) * 4;
-             if (to_read == 0 && available_now > 0) {
-                to_read = min((uint32_t)available_now, audio_len - total_received);
-             }
-             if (to_read == 0) { delay(1); continue; }
-             int read_now = client.readBytes((uint8_t*)audio_buf, to_read);
-             if (read_now > 0) {
-               size_t bytes_written = 0;
-               i2s_write(I2S_SPK_PORT, audio_buf, read_now, &bytes_written, portMAX_DELAY);
-               total_received += read_now;
-             }
-           } else delay(1);
-        }
-      } 
-    }
-
-    if (!isSpeaking) {
-      size_t bytesIn = 0;
-      int16_t wave[512]; 
-      esp_err_t result = i2s_read(I2S_PORT, &wave, sizeof(wave), &bytesIn, 0); 
-      
-      if (result == ESP_OK && bytesIn > 0) {
-        int samples_read = bytesIn / sizeof(wave[0]);
-        for (int i = 0; i < samples_read; ++i) {
-          int32_t sample = (int32_t)wave[i] * MIC_GAIN;
-          if (sample > 32767) sample = 32767;
-          if (sample < -32768) sample = -32768;
-          wave[i] = (int16_t)sample; 
-        }
-        client.write((uint8_t*)wave, samples_read * sizeof(int16_t));
+      uint32_t got = 0; uint8_t buf[1024];
+      while (got < alen && spkClient.connected()) {
+        int av = spkClient.available();
+        if (av > 0) {
+          int tr = min((uint32_t)av, alen - got); tr = min(1024, tr); tr = (tr / 4) * 4;
+          if (tr == 0 && av > 0) tr = min((uint32_t)av, alen - got);
+          int r = spkClient.readBytes(buf, tr);
+          if (r > 0) { size_t bw; i2s_write(I2S_SPK_PORT, buf, r, &bw, portMAX_DELAY); got += r; }
+        } else delay(1);
       }
+      isSpeaking = false;
     }
   }
+  
+  // Status Display
+  static unsigned long lastUpd = 0;
+  if (millis() - lastUpd > 5000 && !isSpeaking) {
+    String mS = micClient.connected() ? "MIC: OK" : "MIC: WAIT";
+    String sS = spkClient.connected() ? "SPK: OK" : "SPK: SCAN";
+    oled("SYSTEM STATUS", mS, sS, WiFi.localIP().toString());
+    lastUpd = millis();
+  }
+  delay(1);
 }
