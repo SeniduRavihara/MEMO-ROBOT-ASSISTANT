@@ -42,6 +42,8 @@ struct AudioChunk {
 volatile bool isRobotSpeaking = false;
 volatile bool isMicActive = false;
 volatile bool isSpkActive = false;
+volatile bool isHwSwitching = false; 
+uint32_t lastVoiceTime = 0; // The Watchdog Timer
 
 void showText(String t1, String t2 = "", String t3 = "") {
   u8g2.clearBuffer();
@@ -55,6 +57,9 @@ void showText(String t1, String t2 = "", String t3 = "") {
 // --- OPTIMIZED HARDWARE SWITCHER ---
 void startMicHardware() {
   if (isMicActive) return;
+  isHwSwitching = true; // Signal tasks to pause hardware access
+  vTaskDelay(100 / portTICK_PERIOD_MS); // Allow pending i2s_read/write to finish
+
   if (isSpkActive) { 
     i2s_stop(I2S_PORT); 
     i2s_driver_uninstall(I2S_PORT); 
@@ -78,11 +83,15 @@ void startMicHardware() {
   i2s_set_pin(I2S_PORT, &pins);
   i2s_start(I2S_PORT);
   isMicActive = true;
+  isHwSwitching = false; // Signal tasks to resume
   Serial.println("[HW] Mic On P0");
 }
 
 void startSpkHardware() {
   if (isSpkActive) return;
+  isHwSwitching = true; // Signal tasks to pause hardware access
+  vTaskDelay(100 / portTICK_PERIOD_MS); // Allow pending i2s_read/write to finish
+
   if (isMicActive) { 
     i2s_stop(I2S_PORT); 
     i2s_driver_uninstall(I2S_PORT); 
@@ -107,6 +116,7 @@ void startSpkHardware() {
   i2s_set_pin(I2S_PORT, &pins);
   i2s_start(I2S_PORT);
   isSpkActive = true;
+  isHwSwitching = false; // Signal tasks to resume
   Serial.println("[HW] Spk On P0");
 }
 
@@ -170,10 +180,16 @@ void audioEngineTask(void *pvParameters) {
   while (true) {
     if (isRobotSpeaking) {
       startSpkHardware();
+      if (isHwSwitching) { vTaskDelay(1); continue; } // Wait for Handoff
+
       AudioChunk spkChunk;
       if (xQueueReceive(spkQueue, &spkChunk, 0) == pdTRUE) {
         size_t bw;
-        i2s_write(I2S_PORT, spkChunk.data, spkChunk.len, &bw, portMAX_DELAY);
+        // Use a timeout of 100ms instead of portMAX_DELAY to prevent "stuck"
+        if (i2s_write(I2S_PORT, spkChunk.data, spkChunk.len, &bw, 100 / portTICK_PERIOD_MS) != ESP_OK) {
+           Serial.println("[WARN] Spk Blocked!");
+        }
+        lastVoiceTime = millis();
         if (uxQueueMessagesWaiting(spkQueue) == 0) {
           vTaskDelay(400 / portTICK_PERIOD_MS); // End-of-speech gap
           isRobotSpeaking = false;
@@ -181,7 +197,10 @@ void audioEngineTask(void *pvParameters) {
       }
     } else {
       startMicHardware();
+      if (isHwSwitching) { vTaskDelay(1); continue; } 
+
       if (i2s_read(I2S_PORT, mic_buf_raw, sizeof(mic_buf_raw), &bytesIn, 0) == ESP_OK && bytesIn > 0) {
+        lastVoiceTime = millis(); // Refresh watchdog
         int samples = bytesIn / 2;
         for (int i = 0; i < samples; i++) {
           int32_t val = (int32_t)mic_buf_raw[i] * MIC_GAIN;
@@ -191,6 +210,17 @@ void audioEngineTask(void *pvParameters) {
         memcpy(micChunk.data, mic_buf_raw, bytesIn);
         xQueueSend(micQueue, &micChunk, 0); 
       }
+    }
+
+    // --- SMART RESET WATCHDOG (CUTOFF) ---
+    if (millis() - lastVoiceTime > 5000 && (isMicActive || isSpkActive)) {
+      Serial.println("[CRITICAL] STUCK DETECTED! Resetting hardware...");
+      isRobotSpeaking = false; 
+      isMicActive = false;
+      isSpkActive = false;
+      i2s_stop(I2S_PORT);
+      i2s_driver_uninstall(I2S_PORT);
+      lastVoiceTime = millis();
     }
     vTaskDelay(1);
   }
