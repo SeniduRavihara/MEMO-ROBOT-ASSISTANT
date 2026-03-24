@@ -1,1 +1,12 @@
 /SAMPLE
+**/.env
+**/temp_input.wav
+**/mic_buffer.wav
+**/pcm_audio.wav
+**/edge_tts_out.mp3
+**/temp_*.wav
+**/temp_*.mp3
+**/node_modules
+**/build
+**/.arduino
+**/.vscode
