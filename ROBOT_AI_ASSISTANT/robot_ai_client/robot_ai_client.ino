@@ -29,8 +29,16 @@ bool isSpeaking = false;
 void showText(const char* t1, const char* t2 = "") {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
+  
+  // Wrap text simply if too long (Quick fix for 128px)
   u8g2.drawStr(0, 15, t1);
-  u8g2.drawStr(0, 35, t2);
+  if (strlen(t2) > 20) {
+    char line1[21]; strncpy(line1, t2, 20); line1[20] = '\0';
+    u8g2.drawStr(0, 35, line1);
+    u8g2.drawStr(0, 55, t2 + 20);
+  } else {
+    u8g2.drawStr(0, 35, t2);
+  }
   u8g2.sendBuffer();
 }
 
@@ -63,7 +71,6 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
   showText("STABLE READY", WiFi.localIP().toString().c_str());
 
-  // Install Driver ONCE (Both TX and RX enabled)
   const i2s_config_t cfg = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX),
     .sample_rate = 16000,
@@ -91,14 +98,30 @@ void loop() {
       if (client.connected()) client.write((uint8_t*)samples, br);
     }
 
-    // Check if server is sending "AUDIO" header
-    if (client.available() >= 5) {
-      char header[6];
-      client.readBytes(header, 5); header[5] = '\0';
-      if (strcmp(header, "AUDIO") == 0) {
+    // Check for "AUDIO" or "TEXT" header
+    if (client.available() >= 8) { // Min header size is 8 - b'TEXT' + length
+      char header[5];
+      client.readBytes(header, 4); header[4] = '\0';
+      
+      uint32_t len;
+      client.readBytes((char*)&len, 4); 
+      // Note: PC sends big-endian, ESP32 is little-endian. Need swap if using struct.pack('>I')
+      len = __builtin_bswap32(len); 
+
+      if (strcmp(header, "TEXT") == 0) {
+        char* text = (char*)malloc(len + 1);
+        client.readBytes(text, len);
+        text[len] = '\0';
+        Serial.printf("[TEXT] Received: %s\n", text);
+        showText("VOICE:", text);
+        free(text);
+      } 
+      else if (strcmp(header, "AUDI") == 0) { // PC sends b'AUDIO' (5 bytes), but we read 4
+        // Trash the 'O'
+        client.read(); 
         isSpeaking = true;
         switchToSpk();
-        showText("AI SPEAKING...");
+        // showText is already done by TEXT header if provided
       }
     }
   } else {
@@ -111,13 +134,12 @@ void loop() {
         i2s_write(I2S_PORT, buf, r, &bw, portMAX_DELAY);
       }
     } else {
-      // End of AI audio (Simple timeout)
       static uint32_t lastData = 0;
       if (client.available() > 0) lastData = millis();
       if (millis() - lastData > 1000 && !client.available()) {
         isSpeaking = false;
         switchToMic();
-        showText("STABLE READY", "Listening...");
+        showText("READY", "Listening...");
       }
     }
   }

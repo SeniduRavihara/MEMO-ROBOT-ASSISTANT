@@ -1,4 +1,4 @@
-# PC AI SERVER: Multimodal Gemini Voice Assistant
+# PC AI SERVER: Multimodal Gemini Voice Assistant (with Transcript)
 import os, socket, struct, io, asyncio, edge_tts, math, wave
 from pydub import AudioSegment
 from dotenv import load_dotenv
@@ -20,7 +20,7 @@ if not GEMINI_API_KEY:
     print("[WARNING] GEMINI_API_KEY not found in .env file!")
 
 genai.configure(api_key=GEMINI_API_KEY)
-# Using flash-latest (1.5 Flash) for free-tier stability
+# Using gemini-flash-latest (1.5 Flash) for free-tier stability
 MODEL_NAME = 'gemini-flash-latest'
 try:
     model = genai.GenerativeModel(MODEL_NAME)
@@ -44,51 +44,53 @@ async def generate_tts(text: str) -> bytes:
         print(f"[ERROR] TTS Failed: {e}")
         return b""
 
-async def get_ai_response_from_audio(audio_data: bytes) -> str:
+async def get_ai_response_from_audio(audio_data: bytes) -> tuple:
+    """Returns (transcript, response_text)"""
     if not GEMINI_API_KEY:
-        return "System error: API key missing."
+        return "Key Missing", "System error: API key missing."
     try:
-        # Convert raw PCM 16kHz to WAV
         wav_buf = io.BytesIO()
         with wave.open(wav_buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
             wf.writeframes(audio_data)
         wav_buf.seek(0)
         
-        # Upload to Gemini (Multimodal)
-        # Note: In a production environment, you might use the Files API, 
-        # but for small clips, we can sometimes send bytes if supported or use a temp file.
-        # Here we'll use a temp file for maximum compatibility with the SDK.
         temp_filename = "temp_input.wav"
-        with open(temp_filename, "wb") as f:
-            f.write(wav_buf.read())
+        with open(temp_filename, "wb") as f: f.write(wav_buf.read())
             
-        # Final check: is there actually sound?
         samples = struct.unpack(f"<{len(audio_data)//2}h", audio_data)
-        if max(samples) < 500: # Very silent
-             return "" 
+        if max(samples) < 500: # Silence check
+            os.remove(temp_filename)
+            return None, None
              
         audio_file = await asyncio.to_thread(genai.upload_file, path=temp_filename, mime_type="audio/wav")
-        
-        # Use a more natural prompt
-        response = await asyncio.to_thread(
-            model.generate_content, 
-            ["You are a friendly robot assistant. Listen to the user's audio and give a very short, helpful response:", audio_file]
+        prompt = (
+            "You are a friendly robot assistant. Listen to the user's audio. "
+            "First, provide a transcript of what the user said (prefixed with 'TRANSCRIPT:'). "
+            "Then, provide your response (prefixed with 'RESPONSE:'). Keep the response very short and concise."
         )
+        response = await asyncio.to_thread(model.generate_content, [prompt, audio_file])
         
-        # Cleanup and extract text
         os.remove(temp_filename)
-        text = response.text.replace("*", "").replace("#", "").strip()
-        return text
+        output = response.text.replace("*", "").replace("#", "").strip()
+        
+        # Parse TRANSCRIPT and RESPONSE
+        transcript = ""
+        reply = ""
+        if "TRANSCRIPT:" in output and "RESPONSE:" in output:
+            parts = output.split("RESPONSE:")
+            transcript = parts[0].replace("TRANSCRIPT:", "").strip()
+            reply = parts[1].strip()
+        else:
+            reply = output # Fallback
+            
+        return transcript, reply
     except Exception as e:
         print(f"[AI ERROR] {e}")
-        return f"System error: {str(e)[:50]}"
+        return "Error", f"System error: {str(e)[:50]}"
 
 async def server_main():
     print(f"\n[AI VOICE SERVER] Port: {LISTEN_PORT}")
-    print(f"API Key: {'[FOUND]' if GEMINI_API_KEY else '[MISSING]'}")
     
     async def client_handler(reader, writer):
         addr = writer.get_extra_info('peername')
@@ -98,21 +100,6 @@ async def server_main():
         is_user_speaking = False
         last_speech_time = 0.0
         
-        # Manual Test Thread
-        async def manual_test():
-            while True:
-                text = await asyncio.to_thread(input, "")
-                if text.strip():
-                    pcm = await generate_tts(text)
-                    if pcm:
-                        header = b'AUDIO' + struct.pack('>I', len(pcm))
-                        writer.write(header)
-                        writer.write(pcm)
-                        await writer.drain()
-                        print("[TEST] Sent to Speaker.")
-
-        asyncio.create_task(manual_test())
-
         while True:
             try:
                 data = await reader.read(2048)
@@ -132,24 +119,30 @@ async def server_main():
                     elif is_user_speaking:
                         if (asyncio.get_event_loop().time() - last_speech_time) > SILENCE_TIMEOUT:
                             is_user_speaking = False
-                            print(f"\n[VAD] User spoke ({len(mic_buffer)} bytes). Calling Gemini Multimodal...")
+                            print(f"\n[VAD] User spoke. Calling Gemini...")
                             
-                            # Real AI Response from Audio
-                            resp_text = await get_ai_response_from_audio(bytes(mic_buffer))
+                            transcript, resp_text = await get_ai_response_from_audio(bytes(mic_buffer))
                             
+                            if transcript:
+                                print(f"[USER] {transcript}")
+                                # Send TEXT header
+                                text_bytes = f"You: {transcript}".encode('utf-8')
+                                header = b'TEXT' + struct.pack('>I', len(text_bytes))
+                                writer.write(header + text_bytes)
+                                await writer.drain()
+
                             if resp_text:
                                 pcm = await generate_tts(resp_text)
                                 if pcm:
                                     header = b'AUDIO' + struct.pack('>I', len(pcm))
-                                    writer.write(header)
-                                    writer.write(pcm)
+                                    writer.write(header + pcm)
                                     await writer.drain()
                                     print("[AI] Response sent to Robot.")
                             
                             mic_buffer.clear()
 
                     bar = "#" * int(rms / 100)
-                    print(f"\r[MIC] RMS: {int(rms):4} | {bar:<30} {'(USER)' if is_user_speaking else '(IDLE)'}", end="", flush=True)
+                    print(f"\r[MIC] RMS: {int(rms):4} | {bar:<30}", end="", flush=True)
 
             except Exception as e:
                 print(f"\n[ERROR] {e}")
@@ -159,11 +152,8 @@ async def server_main():
         writer.close()
 
     server = await asyncio.start_server(client_handler, '0.0.0.0', LISTEN_PORT)
-    async with server:
-        await server.serve_forever()
+    async with server: await server.serve_forever()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(server_main())
-    except KeyboardInterrupt:
-        print("\nCleaning up...")
+    try: asyncio.run(server_main())
+    except KeyboardInterrupt: print("\nCleaning up...")
