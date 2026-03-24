@@ -1,0 +1,8 @@
+google-genai
+python-dotenv
+fastapi
+uvicorn
+edge-tts
+pydub
+SpeechRecognition
+pyaudio
