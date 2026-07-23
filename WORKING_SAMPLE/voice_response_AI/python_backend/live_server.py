@@ -28,10 +28,10 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not set! Please add it to the .env file.")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a friendly AI robot assistant.
-Always reply in ENGLISH ONLY. 
-Be warm, friendly, and concise. 
-NEVER use Sinhala characters or Singlish. Just plain English."""
+ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a friendly AI robot assistant in a continuous live voice conversation.
+Always reply in ENGLISH ONLY using plain, natural text.
+Be warm, direct, and concise (1-2 short sentences max).
+CRITICAL: DO NOT start your replies with repetitive greetings like "Hello!", "Hello there!", or "How can I help you today?" unless the user just greeted you for the first time. Jump straight into answering their question naturally."""
 
 # Models to try in order - fallback if one is rate-limited
 MODELS_TO_TRY = [
@@ -54,6 +54,7 @@ current_language = "en-US"
 robot_socket = None
 socket_lock = threading.Lock()
 is_processing_ai = False
+conversation_history = collections.deque(maxlen=6)
 
 html = """
 <!DOCTYPE html>
@@ -156,6 +157,12 @@ def ask_gemini(audio_bytes):
     
     for model_name in MODELS_TO_TRY:
         try:
+            prompt_text = "Listen to this audio. If you hear someone speaking, transcribe their speech exactly in 'user_transcript' and reply to them in 'ai_response'."
+            if conversation_history:
+                history_str = "\n".join([f"{role}: {msg}" for role, msg in conversation_history])
+                prompt_text += f"\nRecent conversation context:\n{history_str}"
+            prompt_text += "\nIf there is no speech (only silence, noise, or static), set 'user_transcript' to an empty string."
+
             response = gemini_client.models.generate_content(
                 model=model_name,
                 contents=[
@@ -163,7 +170,7 @@ def ask_gemini(audio_bytes):
                         data=wav_bytes,
                         mime_type='audio/wav'
                     ),
-                    "Listen to this audio. If you hear someone speaking, transcribe their speech exactly in 'user_transcript' and reply to them in 'ai_response'. If there is no speech (only silence, noise, or static), set 'user_transcript' to an empty string and set 'ai_response' to a polite message saying you didn't hear anything."
+                    prompt_text
                 ],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -180,7 +187,12 @@ def ask_gemini(audio_bytes):
             )
             print(f"[Gemini OK] model={model_name}")
             data = json.loads(response.text)
-            return data.get("user_transcript", "").strip(), data.get("ai_response", "").strip()
+            u_tx = data.get("user_transcript", "").strip()
+            a_tx = data.get("ai_response", "").strip()
+            if u_tx and a_tx:
+                conversation_history.append(("User", u_tx))
+                conversation_history.append(("MEMO", a_tx))
+            return u_tx, a_tx
         except Exception as e:
             print(f"[Model {model_name}] failed: {e}")
             last_error = e
@@ -241,6 +253,9 @@ def audio_listener_loop(active_loop, target_ip):
             sock.settimeout(None)
             with socket_lock:
                 robot_socket = sock
+            # Instantly trigger ESP32 server.available() and update screen
+            try: sock.sendall(b"TEXT:AI Robot Active! Speak now...\n")
+            except: pass
             print("Connected to Robot Wi-Fi!")
             asyncio.run_coroutine_threadsafe(broadcast("STATUS:✅ Connected! Speak."), active_loop)
             
@@ -270,8 +285,8 @@ def audio_listener_loop(active_loop, target_ip):
                 if not is_speaking:
                     noise_floor_rms = 0.95 * noise_floor_rms + 0.05 * rms
                 
-                # Dynamic VAD Threshold: 1.8x the noise floor (minimum 150)
-                dynamic_threshold = max(150.0, noise_floor_rms * 1.8)
+                # Dynamic VAD Threshold for Far-Field Listening (1.25x noise floor, minimum floor 60.0)
+                dynamic_threshold = max(60.0, noise_floor_rms * 1.25)
                 
                 if rms > dynamic_threshold:
                     if not is_speaking:
