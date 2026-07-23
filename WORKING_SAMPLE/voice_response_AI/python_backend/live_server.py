@@ -3,6 +3,7 @@ import io
 import time
 import struct
 import socket
+import collections
 import math
 import asyncio
 import threading
@@ -16,7 +17,8 @@ from google.genai import types
 from google.genai.types import HarmCategory, HarmBlockThreshold
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-import speech_recognition as sr
+import json
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -33,16 +35,16 @@ NEVER use Sinhala characters or Singlish. Just plain English."""
 
 # Models to try in order - fallback if one is rate-limited
 MODELS_TO_TRY = [
+    'gemini-3.1-flash-lite',
+    'gemini-flash-lite-latest',
     'gemini-2.5-flash',
-    'gemini-2.5-pro',
-    'gemini-flash-latest',
 ]
 
 # --- NETWORK CONFIGURATION ---
 TCP_PORT = 8005
 SAMPLE_RATE = 16000
-SILENCE_THRESHOLD = 500
-MAX_SILENCE_SECONDS = 0.8
+SILENCE_THRESHOLD = 200  # Lower = more sensitive mic detection
+MAX_SILENCE_SECONDS = 0.5  # Seconds of silence before sending to Gemini (shorter = faster response)
 
 app = FastAPI(title="Gemini AI Robot")
 
@@ -51,6 +53,7 @@ connected_clients = set()
 current_language = "en-US"
 robot_socket = None
 socket_lock = threading.Lock()
+is_processing_ai = False
 
 html = """
 <!DOCTYPE html>
@@ -134,31 +137,37 @@ def calculate_rms(audio_bytes):
     sum_sq = sum(int(s)**2 for s in shorts)
     return math.sqrt(sum_sq / count)
 
-def transcribe_audio(audio_bytes, lang):
-    recognizer = sr.Recognizer()
+class RobotResponse(BaseModel):
+    user_transcript: str
+    ai_response: str
+
+def ask_gemini(audio_bytes):
+    """Convert PCM bytes to WAV in memory and send directly to Gemini with structured output."""
+    last_error = None
+    
+    # Wrap PCM bytes in a WAV header
     wav_io = io.BytesIO()
     with wave.open(wav_io, 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(audio_bytes)
-    wav_io.seek(0)
-    try:
-        with sr.AudioFile(wav_io) as source:
-            audio = recognizer.record(source)
-        return recognizer.recognize_google(audio, language=lang)
-    except:
-        return ""
-
-def ask_gemini(text):
-    """Try each model in the fallback list until one works."""
-    last_error = None
+    wav_bytes = wav_io.getvalue()
+    
     for model_name in MODELS_TO_TRY:
         try:
             response = gemini_client.models.generate_content(
                 model=model_name,
-                contents=text,
+                contents=[
+                    types.Part.from_bytes(
+                        data=wav_bytes,
+                        mime_type='audio/wav'
+                    ),
+                    "Listen to this audio. If you hear someone speaking, transcribe their speech exactly in 'user_transcript' and reply to them in 'ai_response'. If there is no speech (only silence, noise, or static), set 'user_transcript' to an empty string and set 'ai_response' to a polite message saying you didn't hear anything."
+                ],
                 config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=RobotResponse,
                     system_instruction=ROBOT_SYSTEM_INSTRUCTION,
                     max_output_tokens=1024,
                     safety_settings=[
@@ -170,12 +179,12 @@ def ask_gemini(text):
                 )
             )
             print(f"[Gemini OK] model={model_name}")
-            # response.text can be None if safety-filtered
-            return (response.text or "").strip() or "Hmm, I could not reply."
+            data = json.loads(response.text)
+            return data.get("user_transcript", "").strip(), data.get("ai_response", "").strip()
         except Exception as e:
             print(f"[Model {model_name}] failed: {e}")
             last_error = e
-            time.sleep(1)  # pause before trying next model
+            time.sleep(1)
     raise last_error
 
 async def broadcast(msg):
@@ -237,25 +246,60 @@ def audio_listener_loop(active_loop, target_ip):
             is_speaking = False
             silence_start = 0
             phrase_buffer = bytearray()
+            # 300ms Pre-Roll Ring Buffer (10 chunks * ~32ms = ~320ms)
+            pre_roll_buffer = collections.deque(maxlen=10)
+            # Adaptive Noise Floor (Exponential Moving Average)
+            noise_floor_rms = 100.0
             
             while True:
                 chunk = sock.recv(1024)
                 if not chunk: break
                 
+                if is_processing_ai:
+                    # Discard audio data while AI is processing to prevent overlapping requests
+                    phrase_buffer.clear()
+                    pre_roll_buffer.clear()
+                    is_speaking = False
+                    silence_start = 0
+                    continue
+                
                 rms = calculate_rms(chunk)
-                if rms > SILENCE_THRESHOLD:
+                
+                # Update adaptive noise floor when silent (EMA smoothing factor = 0.05)
+                if not is_speaking:
+                    noise_floor_rms = 0.95 * noise_floor_rms + 0.05 * rms
+                
+                # Dynamic VAD Threshold: 1.8x the noise floor (minimum 150)
+                dynamic_threshold = max(150.0, noise_floor_rms * 1.8)
+                
+                if rms > dynamic_threshold:
                     if not is_speaking:
                         is_speaking = True
+                        # Include 300ms pre-roll buffer so initial quiet syllables aren't cut off
+                        phrase_buffer.extend(b"".join(pre_roll_buffer))
+                        pre_roll_buffer.clear()
+                        # Instant display feedback on ESP32 screen
+                        with socket_lock:
+                            if robot_socket:
+                                try: robot_socket.sendall(b"TEXT:Listening...\n")
+                                except: pass
                         asyncio.run_coroutine_threadsafe(broadcast("LISTENING_START"), active_loop)
                     phrase_buffer.extend(chunk)
                     silence_start = 0
                 else:
-                    if is_speaking:
+                    if not is_speaking:
+                        pre_roll_buffer.append(chunk)
+                    else:
                         phrase_buffer.extend(chunk)
                         if silence_start == 0: silence_start = time.time()
                         elif time.time() - silence_start > MAX_SILENCE_SECONDS:
                             is_speaking = False
                             silence_start = 0
+                            # Instant status update on ESP32 screen when speech finishes
+                            with socket_lock:
+                                if robot_socket:
+                                    try: robot_socket.sendall(b"TEXT:Thinking...\n")
+                                    except: pass
                             asyncio.run_coroutine_threadsafe(broadcast("LISTENING_STOP"), active_loop)
                             
                             buffer_copy = bytearray(phrase_buffer)
@@ -263,16 +307,19 @@ def audio_listener_loop(active_loop, target_ip):
                             lang_now = current_language
                             
                             def handle_ai(buf, lang, s):
-                                text = transcribe_audio(buf, lang)
-                                if not text:
-                                    asyncio.run_coroutine_threadsafe(broadcast("STATUS:✅ Speak."), active_loop)
-                                    return
-                                
-                                print(f"You said: {text}")
-                                asyncio.run_coroutine_threadsafe(broadcast(f"USER:{text}"), active_loop)
+                                global is_processing_ai
+                                is_processing_ai = True
                                 
                                 try:
-                                    ai_text = ask_gemini(text)
+                                    user_transcript, ai_text = ask_gemini(buf)
+                                    
+                                    if not user_transcript:
+                                        print("[Skip] No speech detected, ignoring.")
+                                        return
+                                    
+                                    print(f"You said: {user_transcript}")
+                                    asyncio.run_coroutine_threadsafe(broadcast(f"USER:{user_transcript}"), active_loop)
+                                    
                                     print(f"Gemini: {ai_text}")
                                     # 1. Send text to OLED (use lock — same socket is being recv'd on main thread)
                                     clean_text = ai_text.replace('\n', ' ').strip()
@@ -284,12 +331,14 @@ def audio_listener_loop(active_loop, target_ip):
                                     # asyncio.run_coroutine_threadsafe(broadcast("STATUS:🔊 Speaking..."), active_loop)
                                     # pcm = text_to_pcm(clean_text)
                                     # speak_on_socket(pcm)
-                                    asyncio.run_coroutine_threadsafe(broadcast("STATUS:✅ Speak."), active_loop)
                                 except Exception as e:
-                                    print("All Gemini models failed:", e)
+                                    print("Gemini voice pipeline failed:", e)
                                     asyncio.run_coroutine_threadsafe(broadcast("STATUS:❌ AI Error"), active_loop)
                                     with socket_lock:
                                         robot_socket = None
+                                finally:
+                                    is_processing_ai = False
+                                    asyncio.run_coroutine_threadsafe(broadcast("STATUS:✅ Speak."), active_loop)
 
                             active_loop.run_in_executor(None, handle_ai, buffer_copy, lang_now, sock)
             
