@@ -237,6 +237,7 @@ def audio_listener_loop(active_loop, target_ip):
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(10)
             sock.connect((target_ip, TCP_PORT))
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(None)
             with socket_lock:
                 robot_socket = sock

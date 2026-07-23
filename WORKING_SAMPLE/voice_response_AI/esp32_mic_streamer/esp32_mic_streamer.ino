@@ -194,7 +194,9 @@ void loop() {
   if (!client.connected()) {
     client = server.available();
     if (client) {
-      Serial.println("PC Connected!");
+      client.setNoDelay(true); // Disable Nagle's algorithm for instant Wi-Fi audio packet transmission
+      client.setTimeout(10);   // Set short read timeout to prevent loop freezing
+      Serial.println("PC Connected (TCP_NODELAY Enabled)!");
       showText("AI Robot Active! Speak now...");
     }
   }
