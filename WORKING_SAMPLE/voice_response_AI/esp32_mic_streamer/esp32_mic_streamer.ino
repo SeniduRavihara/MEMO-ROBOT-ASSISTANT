@@ -4,7 +4,7 @@
 #include <U8g2lib.h>
 
 // --- WIFI CONFIGURATION ---
-const char* ssid = "nubia Neo 3";
+const char* ssid = "HUAWEI nova 3i";
 const char* password = "senidu1234";
 
 // --- TCP SERVER CONFIG ---

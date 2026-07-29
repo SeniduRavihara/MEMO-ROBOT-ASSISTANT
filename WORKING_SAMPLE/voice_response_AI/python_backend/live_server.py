@@ -17,8 +17,6 @@ from google.genai import types
 from google.genai.types import HarmCategory, HarmBlockThreshold
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-import json
-from pydantic import BaseModel
 
 load_dotenv()
 
@@ -28,15 +26,18 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not set! Please add it to the .env file.")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a friendly AI robot assistant in a continuous live voice conversation.
-Always reply in ENGLISH ONLY using plain, natural text.
-Be warm, direct, and concise (1-2 short sentences max).
-CRITICAL: DO NOT start your replies with repetitive greetings like "Hello!", "Hello there!", or "How can I help you today?" unless the user just greeted you for the first time. Jump straight into answering their question naturally."""
+ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a small AI robot with a tiny screen. You are having a live voice chat.
+RULES:
+- Reply in 1 SHORT sentence only (max 15 words). Never write long answers.
+- You understand Sinhala, Singlish, and English. Always reply in English.
+- Be warm and natural. Skip filler like "Sure!", "Of course!", "Great question!".
+- NEVER say "How can I help you?" or "Is there anything else?" — just answer directly.
+- NEVER claim you only understand English or refuse non-English input."""
 
 # Models to try in order - fallback if one is rate-limited
 MODELS_TO_TRY = [
-    'gemini-3.1-flash-lite',
     'gemini-flash-lite-latest',
+    'gemini-3.1-flash-lite',
     'gemini-2.5-flash',
 ]
 
@@ -44,7 +45,7 @@ MODELS_TO_TRY = [
 TCP_PORT = 8005
 SAMPLE_RATE = 16000
 SILENCE_THRESHOLD = 200  # Lower = more sensitive mic detection
-MAX_SILENCE_SECONDS = 0.5  # Seconds of silence before sending to Gemini (shorter = faster response)
+MAX_SILENCE_SECONDS = 0.35  # Seconds of silence before sending to Gemini (shorter = faster response)
 
 app = FastAPI(title="Gemini AI Robot")
 
@@ -138,13 +139,64 @@ def calculate_rms(audio_bytes):
     sum_sq = sum(int(s)**2 for s in shorts)
     return math.sqrt(sum_sq / count)
 
-class RobotResponse(BaseModel):
-    user_transcript: str
-    ai_response: str
+def apply_agc(audio_bytes, gain):
+    """Apply dynamic Software AGC gain scaling to 16-bit PCM samples without clipping."""
+    if gain == 1.0:
+        return audio_bytes
+    count = len(audio_bytes) // 2
+    if count == 0:
+        return audio_bytes
+    shorts = struct.unpack(f"<{count}h", audio_bytes)
+    scaled = []
+    for s in shorts:
+        val = int(s * gain)
+        if val > 32767: val = 32767
+        elif val < -32768: val = -32768
+        scaled.append(val)
+    return struct.pack(f"<{count}h", *scaled)
 
-def ask_gemini(audio_bytes):
-    """Convert PCM bytes to WAV in memory and send directly to Gemini with structured output."""
+def trim_silence_pcm(audio_bytes, threshold=150, frame_size=640):
+    """Strip leading/trailing silent frames from 16-bit PCM to reduce upload payload.
+    frame_size=640 bytes = 320 samples = 20ms at 16kHz."""
+    if len(audio_bytes) < frame_size:
+        return audio_bytes
+    total_frames = len(audio_bytes) // frame_size
+    if total_frames == 0:
+        return audio_bytes
+    
+    # Find first non-silent frame
+    start_frame = 0
+    for i in range(total_frames):
+        frame = audio_bytes[i * frame_size : (i + 1) * frame_size]
+        rms = calculate_rms(frame)
+        if rms > threshold:
+            start_frame = max(0, i - 2)  # Keep 2 frames (~40ms) before speech starts
+            break
+    else:
+        return audio_bytes  # All silent — return as-is for "no speech" detection
+    
+    # Find last non-silent frame
+    end_frame = total_frames - 1
+    for i in range(total_frames - 1, -1, -1):
+        frame = audio_bytes[i * frame_size : (i + 1) * frame_size]
+        rms = calculate_rms(frame)
+        if rms > threshold:
+            end_frame = min(total_frames - 1, i + 2)  # Keep 2 frames (~40ms) after speech ends
+            break
+    
+    trimmed = audio_bytes[start_frame * frame_size : (end_frame + 1) * frame_size]
+    saved_pct = 100 - (len(trimmed) * 100 // len(audio_bytes))
+    if saved_pct > 5:
+        print(f"[Trim] Removed {saved_pct}% silence from audio ({len(audio_bytes)} → {len(trimmed)} bytes)")
+    return trimmed
+
+# ── STEP 1: Speech-to-Text (audio → transcript) ──────────────────────────
+def transcribe_audio(audio_bytes):
+    """Fast STT: send audio to Gemini for transcription ONLY (no response generation)."""
     last_error = None
+    
+    # Trim silence to reduce payload
+    audio_bytes = trim_silence_pcm(audio_bytes)
     
     # Wrap PCM bytes in a WAV header
     wav_io = io.BytesIO()
@@ -157,26 +209,16 @@ def ask_gemini(audio_bytes):
     
     for model_name in MODELS_TO_TRY:
         try:
-            prompt_text = "Listen to this audio. If you hear someone speaking, transcribe their speech exactly in 'user_transcript' and reply to them in 'ai_response'."
-            if conversation_history:
-                history_str = "\n".join([f"{role}: {msg}" for role, msg in conversation_history])
-                prompt_text += f"\nRecent conversation context:\n{history_str}"
-            prompt_text += "\nIf there is no speech (only silence, noise, or static), set 'user_transcript' to an empty string."
-
+            t0 = time.time()
             response = gemini_client.models.generate_content(
                 model=model_name,
                 contents=[
-                    types.Part.from_bytes(
-                        data=wav_bytes,
-                        mime_type='audio/wav'
-                    ),
-                    prompt_text
+                    types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav'),
+                    "Transcribe the spoken words in this audio. The speaker may use Sinhala, Singlish, or English. "
+                    "Output ONLY the transcription text, nothing else. If there is no speech, output exactly: [SILENCE]"
                 ],
                 config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=RobotResponse,
-                    system_instruction=ROBOT_SYSTEM_INSTRUCTION,
-                    max_output_tokens=1024,
+                    max_output_tokens=100,
                     safety_settings=[
                         types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
                         types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
@@ -185,18 +227,64 @@ def ask_gemini(audio_bytes):
                     ]
                 )
             )
-            print(f"[Gemini OK] model={model_name}")
-            data = json.loads(response.text)
-            u_tx = data.get("user_transcript", "").strip()
-            a_tx = data.get("ai_response", "").strip()
-            if u_tx and a_tx:
-                conversation_history.append(("User", u_tx))
-                conversation_history.append(("MEMO", a_tx))
-            return u_tx, a_tx
+            elapsed = int((time.time() - t0) * 1000)
+            transcript = response.text.strip()
+            print(f"[STT] ({elapsed}ms, {model_name}) → \"{transcript}\"")
+            
+            if not transcript or "[SILENCE]" in transcript:
+                return ""
+            return transcript
         except Exception as e:
-            print(f"[Model {model_name}] failed: {e}")
+            print(f"[STT {model_name}] error: {e}")
             last_error = e
-            time.sleep(1)
+            if "429" not in str(e):
+                time.sleep(0.2)
+    raise last_error
+
+# ── STEP 2: Text-to-Response (transcript → AI reply) ─────────────────────
+def ask_gemini_text(user_transcript):
+    """Fast text-only LLM call: no audio upload, just text in → text out."""
+    last_error = None
+    
+    # Build conversation context for continuity
+    context = ""
+    if conversation_history:
+        context = "Recent conversation:\n" + "\n".join(
+            [f"{role}: {msg}" for role, msg in conversation_history]
+        ) + "\n\n"
+    
+    prompt = f"{context}User said: \"{user_transcript}\"\nReply in 1 short sentence (max 15 words)."
+    
+    for model_name in MODELS_TO_TRY:
+        try:
+            t0 = time.time()
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    system_instruction=ROBOT_SYSTEM_INSTRUCTION,
+                    max_output_tokens=60,
+                    safety_settings=[
+                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                    ]
+                )
+            )
+            elapsed = int((time.time() - t0) * 1000)
+            ai_text = response.text.strip()
+            print(f"[LLM] ({elapsed}ms, {model_name}) → \"{ai_text[:80]}...\"")
+            
+            # Save to conversation history
+            conversation_history.append(("User", user_transcript))
+            conversation_history.append(("MEMO", ai_text))
+            return ai_text
+        except Exception as e:
+            print(f"[LLM {model_name}] error: {e}")
+            last_error = e
+            if "429" not in str(e):
+                time.sleep(0.2)
     raise last_error
 
 async def broadcast(msg):
@@ -267,6 +355,10 @@ def audio_listener_loop(active_loop, target_ip):
             # Adaptive Noise Floor (Exponential Moving Average)
             noise_floor_rms = 100.0
             
+            # Software AGC (Automatic Gain Control) state
+            agc_gain = 1.0
+            TARGET_SPEECH_RMS = 3000.0
+            
             while True:
                 chunk = sock.recv(1024)
                 if not chunk: break
@@ -277,16 +369,27 @@ def audio_listener_loop(active_loop, target_ip):
                     pre_roll_buffer.clear()
                     is_speaking = False
                     silence_start = 0
+                    agc_gain = 1.0
                     continue
                 
                 rms = calculate_rms(chunk)
+                
+                # Calculate dynamic AGC gain during speech
+                if rms > 0 and is_speaking:
+                    ideal_gain = TARGET_SPEECH_RMS / rms
+                    ideal_gain = max(1.0, min(ideal_gain, 4.0))
+                    agc_gain = 0.9 * agc_gain + 0.1 * ideal_gain
+                elif not is_speaking:
+                    agc_gain = 0.95 * agc_gain + 0.05 * 1.0  # Reset gain smoothly when silent
+
+                scaled_chunk = apply_agc(chunk, agc_gain)
                 
                 # Update adaptive noise floor when silent (EMA smoothing factor = 0.05)
                 if not is_speaking:
                     noise_floor_rms = 0.95 * noise_floor_rms + 0.05 * rms
                 
-                # Dynamic VAD Threshold for Far-Field Listening (1.25x noise floor, minimum floor 60.0)
-                dynamic_threshold = max(60.0, noise_floor_rms * 1.25)
+                # Dynamic VAD Threshold for Far-Field Listening (1.5x noise floor, minimum floor 250.0)
+                dynamic_threshold = max(250.0, noise_floor_rms * 1.5)
                 
                 if rms > dynamic_threshold:
                     if not is_speaking:
@@ -300,17 +403,18 @@ def audio_listener_loop(active_loop, target_ip):
                                 try: robot_socket.sendall(b"TEXT:Listening...\n")
                                 except: pass
                         asyncio.run_coroutine_threadsafe(broadcast("LISTENING_START"), active_loop)
-                    phrase_buffer.extend(chunk)
+                    phrase_buffer.extend(scaled_chunk)
                     silence_start = 0
                 else:
                     if not is_speaking:
-                        pre_roll_buffer.append(chunk)
+                        pre_roll_buffer.append(scaled_chunk)
                     else:
-                        phrase_buffer.extend(chunk)
+                        phrase_buffer.extend(scaled_chunk)
                         if silence_start == 0: silence_start = time.time()
                         elif time.time() - silence_start > MAX_SILENCE_SECONDS:
                             is_speaking = False
                             silence_start = 0
+                            pre_roll_buffer.clear() # Clear pre-roll buffer to prevent repeating previous phrase
                             # Instant status update on ESP32 screen when speech finishes
                             with socket_lock:
                                 if robot_socket:
@@ -325,19 +429,32 @@ def audio_listener_loop(active_loop, target_ip):
                             def handle_ai(buf, lang, s):
                                 global is_processing_ai
                                 is_processing_ai = True
+                                t_start = time.time()
                                 
                                 try:
-                                    user_transcript, ai_text = ask_gemini(buf)
+                                    # STEP 1: Fast STT (audio → text)
+                                    user_transcript = transcribe_audio(buf)
                                     
                                     if not user_transcript:
                                         print("[Skip] No speech detected, ignoring.")
                                         return
                                     
+                                    # Deduplication filter
+                                    if conversation_history and len(conversation_history) >= 2:
+                                        last_user = conversation_history[-2][1]
+                                        if user_transcript.lower() == last_user.lower():
+                                            print(f"[Filter] Duplicate transcript '{user_transcript}' - skipping.")
+                                            return
+                                    
                                     print(f"You said: {user_transcript}")
                                     asyncio.run_coroutine_threadsafe(broadcast(f"USER:{user_transcript}"), active_loop)
                                     
-                                    print(f"Gemini: {ai_text}")
-                                    # 1. Send text to OLED (use lock — same socket is being recv'd on main thread)
+                                    # STEP 2: Fast text-only LLM (text → response)
+                                    ai_text = ask_gemini_text(user_transcript)
+                                    
+                                    total_ms = int((time.time() - t_start) * 1000)
+                                    print(f"Gemini: {ai_text}  [{total_ms}ms total]")
+                                    # 1. Send text to OLED
                                     clean_text = ai_text.replace('\n', ' ').strip()
                                     with socket_lock:
                                         s.sendall(("TEXT:" + clean_text + "\n").encode('utf-8'))
