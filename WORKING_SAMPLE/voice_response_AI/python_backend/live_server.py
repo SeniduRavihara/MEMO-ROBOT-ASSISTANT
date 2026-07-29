@@ -9,9 +9,11 @@ import asyncio
 import threading
 import wave
 import tempfile
+import numpy as np
 import edge_tts
 from pydub import AudioSegment
 from dotenv import load_dotenv
+from faster_whisper import WhisperModel
 from google import genai
 from google.genai import types
 from google.genai.types import HarmCategory, HarmBlockThreshold
@@ -190,15 +192,47 @@ def trim_silence_pcm(audio_bytes, threshold=150, frame_size=640):
         print(f"[Trim] Removed {saved_pct}% silence from audio ({len(audio_bytes)} → {len(trimmed)} bytes)")
     return trimmed
 
+# ── LOCAL WHISPER STT MODEL ───────────────────────────────────────────────
+print("⏳ Loading Whisper STT model...")
+try:
+    whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    print("✅ Whisper STT model loaded!")
+except Exception as e:
+    print(f"⚠️ Whisper load failed: {e}. Will use Gemini STT fallback.")
+    whisper_model = None
+
 # ── STEP 1: Speech-to-Text (audio → transcript) ──────────────────────────
 def transcribe_audio(audio_bytes):
-    """Fast STT: send audio to Gemini for transcription ONLY (no response generation)."""
-    last_error = None
-    
-    # Trim silence to reduce payload
+    """Fast local STT using Whisper. Falls back to Gemini if Whisper unavailable."""
+    # Trim silence to reduce processing
     audio_bytes = trim_silence_pcm(audio_bytes)
     
-    # Wrap PCM bytes in a WAV header
+    # Try local Whisper first (fast, free, no network)
+    if whisper_model:
+        try:
+            t0 = time.time()
+            # Convert 16-bit PCM bytes to float32 numpy array for Whisper
+            pcm_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            audio_float32 = pcm_int16.astype(np.float32) / 32768.0
+            
+            segments, info = whisper_model.transcribe(
+                audio_float32,
+                beam_size=1,
+                language=None,  # Auto-detect (supports Sinhala + English)
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=200),
+            )
+            transcript = " ".join([seg.text.strip() for seg in segments]).strip()
+            elapsed = int((time.time() - t0) * 1000)
+            print(f"[STT] ({elapsed}ms, whisper-base) → \"{transcript}\"")
+            
+            if not transcript:
+                return ""
+            return transcript
+        except Exception as e:
+            print(f"[Whisper STT error]: {e}, falling back to Gemini...")
+    
+    # Fallback: Gemini cloud STT
     wav_io = io.BytesIO()
     with wave.open(wav_io, 'wb') as wf:
         wf.setnchannels(1)
@@ -230,16 +264,14 @@ def transcribe_audio(audio_bytes):
             elapsed = int((time.time() - t0) * 1000)
             transcript = response.text.strip()
             print(f"[STT] ({elapsed}ms, {model_name}) → \"{transcript}\"")
-            
             if not transcript or "[SILENCE]" in transcript:
                 return ""
             return transcript
         except Exception as e:
             print(f"[STT {model_name}] error: {e}")
-            last_error = e
             if "429" not in str(e):
                 time.sleep(0.2)
-    raise last_error
+    return ""
 
 # ── STEP 2: Text-to-Response (transcript → AI reply) ─────────────────────
 def ask_gemini_text(user_transcript):
