@@ -1,11 +1,15 @@
-bine t#include <driver/i2s.h>
+#include <driver/i2s.h>
 
 // Define the port globally so everyone can see it
 #define I2S_PORT I2S_NUM_0
 
 void setup() {
   Serial.begin(115200);
-  
+  while (!Serial) delay(10);  // Wait for USB CDC to connect
+  Serial.println("=== Mic Test Starting ===");
+  Serial.println("Listening on GPIO 4(SCK), 5(WS), 6(SD)");
+  delay(500);
+
   const i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = 44100,
@@ -19,10 +23,10 @@ void setup() {
   };
 
   const i2s_pin_config_t pin_config = {
-    .bck_io_num = 26, // SCK
-    .ws_io_num = 25,  // WS
+    .bck_io_num = 4,  // SCK (ESP32-S3 N16R8 safe pin)
+    .ws_io_num = 5,   // WS  (ESP32-S3 N16R8 safe pin)
     .data_out_num = -1,
-    .data_in_num = 32 // SD
+    .data_in_num = 6  // SD  (ESP32-S3 N16R8 safe pin)
   };
 
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);

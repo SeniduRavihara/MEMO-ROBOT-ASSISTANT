@@ -15,7 +15,7 @@ U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
 void initDisplay()
 {
-  Wire.begin(4, 15); // Custom I2C Pins: SDA=4, SCL=15
+  Wire.begin(8, 9); // Custom I2C Pins: SDA=8, SCL=9 (ESP32-S3 N16R8 safe)
   u8g2.begin();
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.setDrawColor(1);

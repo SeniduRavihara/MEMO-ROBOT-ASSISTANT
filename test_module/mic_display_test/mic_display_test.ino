@@ -14,17 +14,18 @@
 // comment this to save some memory:
 #define USE_32BIT_SAMPLING
 
-// attach a LED to GPIO 17
-#define LED_PIN GPIO_NUM_17
-#define DEBUG_PIN GPIO_NUM_16
+// attach a LED to GPIO 2 (safe, not conflicting with speaker)
+#define LED_PIN GPIO_NUM_2
+#define DEBUG_PIN GPIO_NUM_1
 
-arduinoFFT FFT = arduinoFFT(); // Create FFT object
- 
+
 #define SAMPLE_BUFFER_SIZE 512  // number of samples
 
 // Computational domain of FFT:
 double vReal[SAMPLE_BUFFER_SIZE];
 double vImag[SAMPLE_BUFFER_SIZE];
+
+ArduinoFFT<double> FFT(vReal, vImag, SAMPLE_BUFFER_SIZE, 8000.0); // v2.x API
 
 // raw waveform data:
 #ifdef USE_32BIT_SAMPLING

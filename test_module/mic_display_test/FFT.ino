@@ -10,10 +10,8 @@ void performFFT()
     vImag[i] = 0;
   }
  
-  // Calculate FFT (33ms)
-  FFT.Windowing(vReal, SAMPLE_BUFFER_SIZE, FFT_WIN_TYP_HAMMING, FFT_FORWARD); // Apply window function (Hamming)
- 
-  FFT.Compute(vReal, vImag, SAMPLE_BUFFER_SIZE, FFT_FORWARD); // FFT
- 
-  FFT.ComplexToMagnitude(vReal, vImag, SAMPLE_BUFFER_SIZE); // Calculate absolute value
+  // Calculate FFT (v2.x API)
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
 }

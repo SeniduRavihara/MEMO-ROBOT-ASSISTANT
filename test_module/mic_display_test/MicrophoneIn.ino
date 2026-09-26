@@ -37,9 +37,9 @@ Connect to ESP32, for example:
 #include <driver/i2s.h>
 
 // connect your INMP441 breakout as following, with L/R - to VCC 3.3V:
-#define I2S_WS GPIO_NUM_25
-#define I2S_SD GPIO_NUM_32
-#define I2S_SCK GPIO_NUM_26
+#define I2S_WS  GPIO_NUM_5   // WS  — ESP32-S3 N16R8 safe
+#define I2S_SD  GPIO_NUM_6   // SD  — ESP32-S3 N16R8 safe
+#define I2S_SCK GPIO_NUM_4   // SCK — ESP32-S3 N16R8 safe
 #define I2S_PORT I2S_NUM_0
 
 //#define SAMPLE_RATE 44100
@@ -135,9 +135,9 @@ void initAmplifier() {
   };
 
   const i2s_pin_config_t pin_amp_config = {
-    .bck_io_num = 14, // Custom BCLK
-    .ws_io_num = 27,  // Custom LRC
-    .data_out_num = 33, // Custom DIN
+    .bck_io_num = 16,  // BCLK — ESP32-S3 N16R8 safe
+    .ws_io_num = 17,   // LRC  — ESP32-S3 N16R8 safe
+    .data_out_num = 15, // DIN  — ESP32-S3 N16R8 safe
     .data_in_num = -1
   };
 

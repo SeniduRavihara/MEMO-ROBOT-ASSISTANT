@@ -1,10 +1,10 @@
 #include <driver/i2s.h>
 #include <math.h>
 
-// I2S Amplifier Pins
-#define I2S_BCLK 14
-#define I2S_LRC  27
-#define I2S_DIN  33
+// I2S Amplifier Pins (ESP32-S3 N16R8 safe pins)
+#define I2S_BCLK 16
+#define I2S_LRC  17
+#define I2S_DIN  15
 
 #define SAMPLE_RATE 44100
 
@@ -39,24 +39,58 @@ void setup() {
   Serial.println("Amplifier initialized. Generating tone...");
 }
 
-void loop() {
-  // Generate a simple 440Hz sine wave tone
-  static float phase = 0;
-  
-  // Create a 16-bit audio sample. 
-  // We multiply the sine wave (-1.0 to 1.0) by a large amplitude.
-  // We keep it a bit below the absolute 16-bit max (32767) to prevent nasty clipping.
-  int16_t sample = (int16_t)(sin(phase) * 10000.0); 
-  
-  size_t bytes_written;
-  i2s_write(I2S_NUM_0, &sample, sizeof(sample), &bytes_written, portMAX_DELAY);
-  
-  // Advance the phase for 440Hz at 44100Hz sample rate
-  // Calculation: 2 * PI * Frequency / SampleRate
-  phase += 2.0 * PI * 440.0 / 44100.0;
-  
-  // Wrap phase to keep math clean
-  if (phase >= 2.0 * PI) {
-    phase -= 2.0 * PI;
+// Note frequencies (Hz)
+#define NOTE_C4  262
+#define NOTE_D4  294
+#define NOTE_E4  330
+#define NOTE_F4  349
+#define NOTE_G4  392
+#define NOTE_A4  440
+#define NOTE_B4  494
+#define NOTE_C5  523
+
+void playTone(int frequency, int durationMs) {
+  Serial.print("Playing tone: ");
+  Serial.print(frequency);
+  Serial.println(" Hz");
+
+  float phase = 0;
+  float phaseStep = 2.0 * PI * frequency / (float)SAMPLE_RATE;
+  int totalSamples = SAMPLE_RATE * durationMs / 1000;
+
+  for (int i = 0; i < totalSamples; i++) {
+    int16_t sample = (int16_t)(sin(phase) * 10000.0);
+    size_t bytes_written;
+    i2s_write(I2S_NUM_0, &sample, sizeof(sample), &bytes_written, portMAX_DELAY);
+    phase += phaseStep;
+    if (phase >= 2.0 * PI) phase -= 2.0 * PI;
   }
+
+  // Short silence between notes
+  int16_t silence = 0;
+  for (int i = 0; i < SAMPLE_RATE / 10; i++) {
+    size_t bytes_written;
+    i2s_write(I2S_NUM_0, &silence, sizeof(silence), &bytes_written, portMAX_DELAY);
+  }
+}
+
+void loop() {
+  Serial.println("\n=== Playing C Major Scale ===");
+  playTone(NOTE_C4, 400);
+  playTone(NOTE_D4, 400);
+  playTone(NOTE_E4, 400);
+  playTone(NOTE_F4, 400);
+  playTone(NOTE_G4, 400);
+  playTone(NOTE_A4, 400);
+  playTone(NOTE_B4, 400);
+  playTone(NOTE_C5, 600);
+
+  delay(500);
+
+  Serial.println("=== Playing Beep Pattern ===");
+  playTone(NOTE_C5, 150);
+  playTone(NOTE_C5, 150);
+  playTone(NOTE_G4, 500);
+
+  delay(1000);
 }
