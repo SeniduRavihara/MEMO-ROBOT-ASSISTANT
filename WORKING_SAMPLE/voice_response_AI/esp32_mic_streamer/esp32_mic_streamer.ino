@@ -85,6 +85,7 @@ volatile bool isSpeaking = false;
 EyeEmotion postSpeechEmotion = EMOTION_HAPPY;
 unsigned long emotionHoldUntil = 0;
 unsigned long lastEyeRender = 0;
+unsigned long lastChunkTime = 0;
 
 // --- LOCAL SOUND INTELLIGENCE STATE ---
 float noiseFloor = 200.0f;
@@ -401,6 +402,75 @@ void loop() {
         handleServerText(text);
       }
 
+      // ── CHUNK COMMAND (Real-time Streaming TTS Audio from PC) ─────────────
+      else if (strcmp(header_peek, "CHUNK") == 0) {
+        unsigned long startWaitLen = millis();
+        while (client.connected() && client.available() < 4) {
+          renderEyes();
+          delay(1);
+          if (millis() - startWaitLen > 2000) break;
+        }
+
+        if (client.available() >= 4) {
+          uint8_t len_buf[4];
+          client.readBytes(len_buf, 4);
+          uint32_t chunk_len = ((uint32_t)len_buf[0] << 24) |
+                               ((uint32_t)len_buf[1] << 16) |
+                               ((uint32_t)len_buf[2] << 8)  |
+                                (uint32_t)len_buf[3];
+
+          lastChunkTime = millis();
+
+          if (chunk_len > 0) {
+            isSpeaking = true;
+            eyes.setEmotion(EMOTION_SPEAKING);
+
+            uint32_t total_received = 0;
+            uint8_t stream_buf[2048];
+            unsigned long start_recv = millis();
+
+            while (total_received < chunk_len && client.connected()) {
+              int avail = client.available();
+              if (avail > 0) {
+                int to_read = min((uint32_t)avail, chunk_len - total_received);
+                to_read = min((uint32_t)2048, (uint32_t)to_read);
+                to_read = (to_read / 4) * 4;
+                if (to_read == 0) { delay(1); continue; }
+                int got = client.readBytes((char*)stream_buf, to_read);
+                if (got > 0) {
+                  size_t wr = 0;
+                  i2s_write(I2S_SPK_PORT, stream_buf, got, &wr, portMAX_DELAY);
+                  total_received += got;
+                  start_recv = millis();
+                  lastChunkTime = millis();
+                }
+              } else {
+                delay(1);
+                if (millis() - start_recv > 3000) {
+                  Serial.println("[CHUNK] ⚠️ Timeout waiting for chunk data!");
+                  break;
+                }
+              }
+              renderEyes();
+            }
+          } else {
+            // chunk_len == 0 signals End of Audio Stream
+            // Smoothly push zeros through DMA to flush remaining audio and prevent speaker pop/radio clicks
+            uint8_t zero_flush[2048] = {0};
+            for (int z = 0; z < 4; z++) {
+              size_t zwr = 0;
+              i2s_write(I2S_SPK_PORT, zero_flush, sizeof(zero_flush), &zwr, portMAX_DELAY);
+            }
+            delay(250); // Allow hardware DMA to clock out the zero tail cleanly
+            isSpeaking = false;
+            eyes.setEmotion(postSpeechEmotion);
+            emotionHoldUntil = millis() + 3500;
+            lastSpeechTime = millis();
+            Serial.println("[CHUNK] Streaming audio finished.");
+          }
+        }
+      }
+
       // ── AUDIO COMMAND (Download into PSRAM & play with animated eyes) ──────
       else if (strcmp(header_peek, "AUDIO") == 0) {
         while (client.connected() && client.available() < 4) {
@@ -480,8 +550,13 @@ void loop() {
           }
         }
 
-        // Allow DMA queue to finish clocking out the last samples
-        delay(180);
+        // Push silence zeros to cleanly settle DAC and allow DMA queue to finish clocking out
+        uint8_t zero_flush[2048] = {0};
+        for (int z = 0; z < 4; z++) {
+          size_t zwr = 0;
+          i2s_write(I2S_SPK_PORT, zero_flush, sizeof(zero_flush), &zwr, portMAX_DELAY);
+        }
+        delay(250);
         isSpeaking = false;
 
         // Transition to post-speech emotion (e.g. Happy ^ ^)
@@ -535,6 +610,13 @@ void loop() {
       eyes.setEmotion(EMOTION_NEUTRAL);
     }
     emotionHoldUntil = 0;
+  }
+
+  // Safety watchdog: reset speaking state if no chunk received for 6 seconds
+  if (isSpeaking && (now - lastChunkTime > 6000)) {
+    isSpeaking = false;
+    eyes.setEmotion(EMOTION_NEUTRAL);
+    Serial.println("[CHUNK] ⚠️ Safety watchdog: reset speaking state");
   }
 
   // 5. MPU6050 Gyro Tilt & Shake Handling
