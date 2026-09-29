@@ -1,27 +1,18 @@
 /*
  * ============================================================================
- *  MEMO AI Robot Assistant — ESP32-S3 N16R8 Firmware
- *  (Vector-Style Expressive Eye Engine + Local Voice Reactivity + Live Pipeline)
+ *  MEMO AI Robot Assistant — ESP32-S3 N16R8 Dual-Core Firmware
+ *  (Core 1: Direct Audio DMA & TCP Engine | Core 0: 40 FPS FFT & OLED Display)
  * ============================================================================
- *  Features:
- *    1. Full-screen Vector-style procedural eyes (SSD1306 OLED via U8g2)
- *    2. LOCAL SOUND & VOICE REACTIVITY (Works 100% standalone, no PC needed!):
- *         - Voice Activity Detection (VAD) with adaptive room noise floor
- *         - Talks to MEMO  -> Eyes perk up into LISTENING or CURIOUS with real-time audio pulse
- *         - Finishes talking -> Cheerful smile (^ ^) and natural blink
- *         - Claps / Loud noise -> Startled SURPRISED eyes pop wide open!
- *         - Quiet room (30s)  -> Eyes slowly droop to SLEEPY (- -)
- *         - Make a sound      -> Snaps awake instantly!
- *    3. PC / GEMINI CLOUD INTEGRATION (When connected):
- *         - Seamlessly handles live voice conversations with LLM
- *         - Thinking... -> Glancing up-right & pulse (EMOTION_THINKING)
- *         - Speaking... -> Speech bounce + animated mouth (EMOTION_SPEAKING)
- *         - Post-speech -> Emotion based on AI reply sentiment
- *    4. MPU6050 Gyro/IMU integration:
- *         - Physically tracks room tilt with his gaze
- *         - Shaking MEMO triggers DIZZY spinning stars (EMOTION_DIZZY)
- *    5. Gapless 8MB PSRAM audio buffering (ps_malloc) for MAX98357A I2S speaker
- *    6. Chunked playback with non-blocking eye animation (~45 FPS)
+ *  Architecture:
+ *    - Core 1 (Arduino loop — Dedicated Audio & TCP Engine):
+ *        * 100% Dedicated to I2S Microphone (INMP441) and Speaker (MAX98357A)
+ *        * Direct, non-blocking TCP streaming to Python (exact proven 3f29f20 logic)
+ *        * Direct instant streaming playback to speaker (zero PSRAM dependency)
+ *        * ZERO display code on Core 1 -> Audio never drops, never lags!
+ *    - Core 0 (Background displayTask — Dedicated Visualizer):
+ *        * Computes 512-point FFT from fft_wave buffer
+ *        * Renders real-time audio spectrum histogram (0..2kHz, 0dB, -20dB, -40dB) at ~40 FPS
+ *        * 100% fluid, instant millisecond changes on OLED display!
  * ============================================================================
  */
 
@@ -31,7 +22,7 @@
 #include <U8g2lib.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include "MemoEyes.h"
+#include "arduinoFFT.h"
 
 // --- WIFI CONFIGURATION ---
 const char* ssid     = "HUAWEI nova 3i";
@@ -55,231 +46,182 @@ WiFiClient client;
 #define I2S_SPK_LRC  GPIO_NUM_17
 #define I2S_SPK_PORT I2S_NUM_1
 
-// I2C Pins (Shared by OLED and MPU6050)
+// I2C Pins (OLED Display & MPU6050)
 #define I2C_SDA 8
 #define I2C_SCL 9
 
 // --- AUDIO CONFIGURATION ---
 #define SAMPLE_RATE          16000
 #define MIC_BITS_PER_SAMPLE  I2S_BITS_PER_SAMPLE_16BIT
-#define MIC_GAIN             4
+#define MIC_GAIN             8
+#define MIC_BUF_SAMPLES      512
 
-// PSRAM audio buffer (1MB = ~16s of 16kHz 16-bit stereo)
-#define AUDIO_BUF_SIZE (1024 * 1024)
-uint8_t* audio_psram_buf = nullptr;
+// Static mic buffer (1024 bytes = 512 samples)
+int16_t mic_buf[MIC_BUF_SAMPLES];
 
-// Mic read buffer (512 samples = 32ms of audio)
-#define MIC_BUF_SAMPLES 512
-int16_t* mic_buf = nullptr;
-
-// --- DISPLAY & VECTOR EYES ---
+// --- DISPLAY & LIVE SPECTRUM FFT ---
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
-MemoEyes eyes;
 
-// --- OPTIONAL MPU6050 GYROSCOPE ---
+#define FFT_SAMPLES 512
+double vReal[FFT_SAMPLES];
+double vImag[FFT_SAMPLES];
+ArduinoFFT<double> FFT(vReal, vImag, FFT_SAMPLES, (double)SAMPLE_RATE);
+
+int16_t fft_wave[FFT_SAMPLES];
+double maxWave = 0.0;
+char robotStatusText[32] = "MEMO Ready";
+
+// --- MPU6050 ---
 Adafruit_MPU6050 mpu;
 bool mpuAvailable = false;
 
 // --- STATE MANAGEMENT ---
 volatile bool isSpeaking = false;
-EyeEmotion postSpeechEmotion = EMOTION_HAPPY;
-unsigned long emotionHoldUntil = 0;
-unsigned long lastEyeRender = 0;
 unsigned long lastChunkTime = 0;
 
-// --- LOCAL SOUND INTELLIGENCE STATE ---
-float noiseFloor = 200.0f;
-unsigned long lastSpeechTime = 0;
-unsigned long speechStartTime = 0;
-bool userSpeakingLocally = false;
-bool isSleepy = false;
+// Spectrum layout coordinates
+#define PX2 0
+#define PY1 12 // Top area for status
+#define PY2 54 // Lower edge of spectrum (-40dB)
 
-// ── RENDER EYES NON-BLOCKING (~45 FPS) ──────────────────────────────────────
-void renderEyes() {
-  unsigned long now = millis();
-  if (now - lastEyeRender >= 22) { // 22ms = ~45 FPS
-    lastEyeRender = now;
-    eyes.update();
-    u8g2.clearBuffer();
-    eyes.render(u8g2);
-    u8g2.sendBuffer();
+// ── SPECTRUM GRAPHICS FUNCTIONS (Core 0) ────────────────────────────────────
+int barLength(double d) {
+  float fy = 14.0 * (log10(d + 1e-6) + 1.5);
+  int y = fy;
+  return constrain(y, 0, 40);
+}
+
+void showSpectrum() {
+  static int peak[128] = {0};
+  for (int xi = 1; xi < 128; xi++) {
+    int d = barLength(vReal[xi]);
+    u8g2.drawVLine(xi + PX2, PY2 - d, d);
+    u8g2.drawVLine(xi + PX2, PY2 - peak[xi], 1);
+    if (peak[xi] < d) peak[xi] = d;
+    if (peak[xi] > 0) peak[xi]--;
   }
 }
 
-// ── TEXT DISPLAY HELPER (Boot & Errors Only) ────────────────────────────────
+void showOthers() {
+  u8g2.drawHLine(0, PY2, 128); // Spectrum bottom line
+
+  // Frequency ticks
+  for (int xp = PX2; xp < 127; xp += 5) {
+    u8g2.drawVLine(xp, PY2 + 1, 1);
+  }
+  u8g2.drawVLine(PX2 + 25, PY2 + 1, 2);
+  u8g2.drawVLine(PX2 + 50, PY2 + 1, 2);
+
+  // Frequency labels
+  u8g2.setFont(u8g2_font_micro_tr);
+  u8g2.setCursor(0, 56);   u8g2.print("0");
+  u8g2.setCursor(55, 56);  u8g2.print("1k");
+  u8g2.setCursor(115, 56); u8g2.print("2k");
+
+  // Dotted dB lines
+  for (int y = PY2 - 7; y > 14; y -= 14) {
+    for (int x = 0; x < 100; x += 5) {
+      u8g2.drawHLine(x, y, 2);
+    }
+  }
+
+  // dB labels
+  u8g2.setFont(u8g2_font_micro_tr);
+  u8g2.setCursor(102, 16); u8g2.print("0dB");
+  u8g2.setCursor(102, 29); u8g2.print("-20");
+  u8g2.setCursor(102, 43); u8g2.print("-40");
+
+  // Status line in top band
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 0, robotStatusText);
+}
+
+void displayAll() {
+  u8g2.clearBuffer();
+  showSpectrum();
+  showOthers();
+  u8g2.sendBuffer();
+}
+
+void performFFT() {
+  maxWave = 0.0;
+  for (int i = 0; i < FFT_SAMPLES; i++) {
+    vReal[i] = (double)fft_wave[i] * 3.3 / 4096.0;
+    vImag[i] = 0;
+    int tmp = abs(fft_wave[i]);
+    if (tmp > maxWave) maxWave = tmp;
+  }
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+}
+
+// ── TEXT DISPLAY HELPER (Boot Only) ──────────────────────────────────────────
 void showText(String text) {
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tf);
-  int y = 14;
+  int y = 0;
   int startIdx = 0;
   while (startIdx < (int)text.length()) {
     String line = text.substring(startIdx, startIdx + 21);
     u8g2.drawStr(0, y, line.c_str());
     y += 12;
     startIdx += 21;
-    if (y > 60) break;
+    if (y > 54) break;
   }
   u8g2.sendBuffer();
 }
 
-// ── LOCAL VOICE ACTIVITY & SOUND INTELLIGENCE ───────────────────────────────
-void processLocalAudio(float rms, int16_t peak, unsigned long now) {
-  // 1. Update adaptive room noise floor during quiet periods
-  if (rms < noiseFloor * 1.4f) {
-    noiseFloor = 0.985f * noiseFloor + 0.015f * rms;
-    if (noiseFloor < 80.0f)   noiseFloor = 80.0f;
-    if (noiseFloor > 1000.0f) noiseFloor = 1000.0f;
-  }
-
-  // 2. Sudden Loud Noise (Clap, Snap, Shout, Desk Slap) -> SURPRISED!
-  float clapThreshold = noiseFloor + 2200.0f;
-  if (rms > clapThreshold || peak > 22000) {
-    eyes.setEmotion(EMOTION_SURPRISED);
-    emotionHoldUntil = now + 1600; // Hold wide surprised eyes for 1.6s
-    lastSpeechTime = now;
-    isSleepy = false;
-    Serial.printf("[Local Audio] 💥 Loud noise detected! RMS: %.0f, Peak: %d\n", rms, peak);
-    return;
-  }
-
-  // 3. Human Speech Detection
-  float speechThreshold = max(350.0f, noiseFloor * 2.2f);
-  if (rms > speechThreshold) {
-    lastSpeechTime = now;
-    eyes.setAudioLevel((uint16_t)rms); // Real-time pulse with voice volume!
-
-    // If robot was asleep, wake up immediately!
-    if (isSleepy) {
-      isSleepy = false;
-      eyes.setEmotion(EMOTION_HAPPY);
-      emotionHoldUntil = now + 2000;
-      eyes.blink();
-      Serial.println("[Local Audio] ☀️ Heard voice! Snapping awake from sleep.");
-      return;
-    }
-
-    // New utterance started
-    if (!userSpeakingLocally) {
-      userSpeakingLocally = true;
-      speechStartTime = now;
-
-      // Only change emotion if not in middle of server thinking/speaking
-      if (eyes.getEmotion() != EMOTION_THINKING && eyes.getEmotion() != EMOTION_SPEAKING) {
-        // Randomly choose between attentive listening and curious raised eyebrow
-        if (random(100) < 65) {
-          eyes.setEmotion(EMOTION_LISTENING);
-        } else {
-          eyes.setEmotion(EMOTION_CURIOUS);
-        }
-        eyes.center();
-      }
-      Serial.printf("[Local Audio] 🗣️ Speech detected! RMS: %.0f (Noise floor: %.0f)\n", rms, noiseFloor);
-    }
-  } 
-  else {
-    // 4. Silence Handling
-    if (userSpeakingLocally) {
-      // If user has stopped talking for > 850ms
-      if (now - lastSpeechTime > 850) {
-        userSpeakingLocally = false;
-        unsigned long speechDuration = lastSpeechTime - speechStartTime;
-
-        // If the utterance was longer than 200ms (ignoring brief mic clicks)
-        if (speechDuration > 200) {
-          Serial.printf("[Local Audio] ✅ Speech finished (%lums).\n", speechDuration);
-
-          // If standalone (no PC connected to answer), acknowledge with a smile and blink!
-          if (!client.connected() && eyes.getEmotion() != EMOTION_THINKING && eyes.getEmotion() != EMOTION_SPEAKING) {
-            eyes.setEmotion(EMOTION_HAPPY);
-            emotionHoldUntil = now + 3000;
-            eyes.blink();
-          }
-        }
-      }
-    }
-
-    // 5. Boredom / Sleepiness: If room is silent for > 30 seconds
-    if (now - lastSpeechTime > 30000 && !isSleepy && !client.connected() && emotionHoldUntil == 0) {
-      isSleepy = true;
-      eyes.setEmotion(EMOTION_SLEEPY);
-      Serial.println("[Local Audio] 💤 Room quiet for 30s. Going to sleep (- -)...");
-    }
-  }
-}
-
-// ── SERVER COMMAND PARSER (When PC is Connected) ────────────────────────────
+// ── SERVER COMMAND PARSER ───────────────────────────────────────────────────
 void handleServerText(String text) {
   text.trim();
   Serial.println(">>> SERVER TEXT: " + text);
 
   if (text.startsWith("Listening")) {
-    eyes.setEmotion(EMOTION_LISTENING);
-    emotionHoldUntil = 0;
-  } 
-  else if (text.startsWith("Thinking")) {
-    eyes.setEmotion(EMOTION_THINKING);
-    emotionHoldUntil = 0;
-  } 
-  else if (text.startsWith("AI Robot Active")) {
-    eyes.setEmotion(EMOTION_HAPPY);
-    emotionHoldUntil = millis() + 2500;
-  } 
-  else {
-    // AI response text -> analyze sentiment to pick post-speech reaction
-    String lower = text;
-    lower.toLowerCase();
-
-    if (lower.indexOf("sorry") >= 0 || lower.indexOf("sad") >= 0 || lower.indexOf("bad") >= 0) {
-      postSpeechEmotion = EMOTION_SAD;
-    } else if (lower.indexOf("happy") >= 0 || lower.indexOf("great") >= 0 || lower.indexOf("love") >= 0 ||
-               lower.indexOf("glad") >= 0 || lower.indexOf("awesome") >= 0 || lower.indexOf("haha") >= 0 ||
-               lower.indexOf("nice") >= 0 || lower.indexOf("sure") >= 0 || lower.indexOf("welcome") >= 0) {
-      postSpeechEmotion = EMOTION_HAPPY;
-    } else if (lower.indexOf("?") >= 0 || lower.indexOf("why") >= 0 || lower.indexOf("curious") >= 0 || lower.indexOf("how") >= 0) {
-      postSpeechEmotion = EMOTION_CURIOUS;
-    } else if (lower.indexOf("wow") >= 0 || lower.indexOf("whoa") >= 0 || lower.indexOf("really") >= 0) {
-      postSpeechEmotion = EMOTION_SURPRISED;
+    strncpy(robotStatusText, "Listening...", sizeof(robotStatusText) - 1);
+  } else if (text.startsWith("Thinking")) {
+    strncpy(robotStatusText, "Thinking...", sizeof(robotStatusText) - 1);
+  } else if (text.startsWith("AI Robot Active")) {
+    strncpy(robotStatusText, "MEMO Ready!", sizeof(robotStatusText) - 1);
+  } else {
+    if (text.length() > 20) {
+      String shortText = text.substring(0, 18) + "..";
+      strncpy(robotStatusText, shortText.c_str(), sizeof(robotStatusText) - 1);
     } else {
-      postSpeechEmotion = EMOTION_HAPPY;
+      strncpy(robotStatusText, text.c_str(), sizeof(robotStatusText) - 1);
     }
+  }
+}
+
+// ── CORE 0: DEDICATED FLUID DISPLAY TASK (~40 FPS) ──────────────────────────
+void displayTask(void* pvParameters) {
+  for (;;) {
+    if (!isSpeaking) {
+      performFFT();
+      displayAll();
+    }
+    vTaskDelay(pdMS_TO_TICKS(22)); // ~40 FPS ultra-fluid visualizer on Core 0!
   }
 }
 
 // ── SETUP ────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
+  delay(500);
 
-  // 1. Initialize I2C (400kHz Fast Mode)
+  Serial.println("\n========================================");
+  Serial.println("  🤖 MEMO AI ROBOT DUAL-CORE FIRMWARE");
+  Serial.println("  Core 1: Direct Audio DMA | Core 0: 40 FPS OLED");
+  Serial.println("========================================");
+
+  // 1. Initialize I2C with 400kHz Fast Mode & OLED Display
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
-
-  // 2. Initialize OLED Display
   u8g2.begin();
-  showText("MEMO Booting...");
+  u8g2.setFontPosTop();
+  showText("MEMO Booting...\nDual-Core Setup");
 
-  // 3. Initialize PSRAM (8MB Octal PSRAM)
-  if (psramInit()) {
-    Serial.println("[PSRAM] ✅ Initialized!");
-    Serial.printf("[PSRAM] Free: %u KB\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
-  } else {
-    Serial.println("[PSRAM] ❌ Failed to initialize!");
-  }
-
-  // 4. Allocate audio buffers in PSRAM
-  audio_psram_buf = (uint8_t*) heap_caps_malloc(AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
-  if (audio_psram_buf) {
-    Serial.printf("[PSRAM] Audio buffer: %u KB allocated\n", AUDIO_BUF_SIZE / 1024);
-  } else {
-    Serial.println("[PSRAM] ❌ Audio buffer allocation failed!");
-  }
-
-  mic_buf = (int16_t*) heap_caps_malloc(MIC_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-  if (!mic_buf) {
-    mic_buf = (int16_t*) malloc(MIC_BUF_SAMPLES * sizeof(int16_t));
-    Serial.println("[RAM] Mic buffer in internal RAM (fallback)");
-  }
-
-  // 5. Connect to Wi-Fi
+  // 2. Connect to Wi-Fi
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
@@ -292,7 +234,7 @@ void setup() {
     delay(500);
     Serial.print(".");
     if (++attempts > 25) {
-      Serial.println("\n[WiFi] Connection timeout. Proceeding in Autonomous Standalone mode...");
+      Serial.println("\n[WiFi] Connection timeout. Standalone mode.");
       showText("Standalone Mode\n(No Wi-Fi)");
       delay(1200);
       break;
@@ -306,7 +248,7 @@ void setup() {
     delay(1200);
   }
 
-  // 6. Initialize I2S Microphone (INMP441 — Port 0)
+  // 3. Initialize I2S Microphone (INMP441 — Port 0, 32 DMA buffers = 2.0s FIFO)
   const i2s_config_t i2s_config = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate          = SAMPLE_RATE,
@@ -331,7 +273,7 @@ void setup() {
   i2s_set_pin(I2S_PORT, &pin_config);
   i2s_start(I2S_PORT);
 
-  // 7. Initialize I2S Speaker (MAX98357A — Port 1)
+  // 4. Initialize I2S Speaker (MAX98357A — Port 1)
   const i2s_config_t spk_i2s_config = {
     .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
     .sample_rate          = SAMPLE_RATE,
@@ -354,27 +296,29 @@ void setup() {
   i2s_set_pin(I2S_SPK_PORT, &spk_pin_config);
   i2s_start(I2S_SPK_PORT);
 
-  // 8. Try initializing MPU6050 (optional)
+  // 5. Optional MPU6050
   if (mpu.begin()) {
     mpuAvailable = true;
     mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-    Serial.println("[MPU6050] ✅ IMU detected: Tilt tracking active!");
-  } else {
-    mpuAvailable = false;
-    Serial.println("[MPU6050] ℹ️ IMU not detected (optional).");
   }
 
-  // 9. Initialize Vector Eye Engine
-  eyes.begin();
-  eyes.setEmotion(EMOTION_HAPPY);
-  emotionHoldUntil = millis() + 2500;
-  lastSpeechTime = millis();
+  // 6. Launch Dedicated Fluid Spectrum Display Task on Core 0 (Priority 1)
+  // Completely offloads OLED rendering and FFT calculation from Core 1!
+  xTaskCreatePinnedToCore(
+    displayTask,
+    "DisplayTask",
+    4096,
+    NULL,
+    1,
+    NULL,
+    0  // Pin to Core 0!
+  );
 
-  Serial.println("[Setup] Complete — MEMO is alive and listening!");
+  Serial.println("[Setup] Ready! Core 1: Audio DMA & TCP | Core 0: 40 FPS OLED Display");
 }
 
-// ── MAIN LOOP ────────────────────────────────────────────────────────────────
+// ── CORE 1: MAIN AUDIO & TCP ENGINE LOOP ────────────────────────────────────
 void loop() {
   unsigned long now = millis();
 
@@ -382,306 +326,169 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED && !client.connected()) {
     client = server.available();
     if (client) {
-      Serial.println("[TCP] PC Connected!");
-      eyes.setEmotion(EMOTION_HAPPY);
-      emotionHoldUntil = now + 2500;
-      isSleepy = false;
+      client.setNoDelay(true); // Disable Nagle's algorithm for instant streaming!
+      client.setTimeout(10);   // Fast timeout
+      Serial.println("[TCP] PC Connected (TCP_NODELAY Enabled)!");
+      strncpy(robotStatusText, "PC Connected!", sizeof(robotStatusText) - 1);
     }
   }
 
   // 2. Handle Incoming TCP Commands from PC
-  if (client.connected()) {
-    if (client.available() >= 5) {
-      char header_peek[6];
-      client.readBytes(header_peek, 5);
-      header_peek[5] = '\0';
+  if (client.connected() && client.available() >= 5) {
+    char header_peek[6];
+    client.readBytes(header_peek, 5);
+    header_peek[5] = '\0';
 
-      // ── TEXT COMMAND ───────────────────────────────────────────────────────
-      if (strcmp(header_peek, "TEXT:") == 0) {
-        String text = client.readStringUntil('\n');
-        handleServerText(text);
-      }
+    // ── TEXT COMMAND ────────────────────────────────────────────────────────
+    if (strcmp(header_peek, "TEXT:") == 0) {
+      String text = client.readStringUntil('\n');
+      handleServerText(text);
+    }
 
-      // ── CHUNK COMMAND (Real-time Streaming TTS Audio from PC) ─────────────
-      else if (strcmp(header_peek, "CHUNK") == 0) {
-        unsigned long startWaitLen = millis();
-        while (client.connected() && client.available() < 4) {
-          renderEyes();
-          delay(1);
-          if (millis() - startWaitLen > 2000) break;
-        }
+    // ── CHUNK STREAMING AUDIO COMMAND ───────────────────────────────────────
+    else if (strcmp(header_peek, "CHUNK") == 0) {
+      while (client.connected() && client.available() < 4) delay(1);
+      uint8_t len_buf[4];
+      client.readBytes(len_buf, 4);
+      uint32_t chunk_len = ((uint32_t)len_buf[0] << 24) |
+                           ((uint32_t)len_buf[1] << 16) |
+                           ((uint32_t)len_buf[2] << 8)  |
+                            (uint32_t)len_buf[3];
 
-        if (client.available() >= 4) {
-          uint8_t len_buf[4];
-          client.readBytes(len_buf, 4);
-          uint32_t chunk_len = ((uint32_t)len_buf[0] << 24) |
-                               ((uint32_t)len_buf[1] << 16) |
-                               ((uint32_t)len_buf[2] << 8)  |
-                                (uint32_t)len_buf[3];
+      if (chunk_len > 0) {
+        isSpeaking = true;
+        strncpy(robotStatusText, "AI Speaking...", sizeof(robotStatusText) - 1);
+        lastChunkTime = millis();
 
-          lastChunkTime = millis();
+        uint32_t total_got = 0;
+        uint8_t mono_buf[1024];
 
-          if (chunk_len > 0) {
-            isSpeaking = true;
-            eyes.setEmotion(EMOTION_SPEAKING);
+        while (total_got < chunk_len && client.connected()) {
+          int avail = client.available();
+          if (avail > 0) {
+            int to_read = min((uint32_t)avail, chunk_len - total_got);
+            to_read = min((uint32_t)1024, (uint32_t)to_read);
+            to_read = (to_read / 2) * 2;
+            if (to_read == 0) { delay(1); continue; }
 
-            uint32_t total_received = 0;
-            uint8_t stream_buf[2048];
-            unsigned long start_recv = millis();
-
-            while (total_received < chunk_len && client.connected()) {
-              int avail = client.available();
-              if (avail > 0) {
-                int to_read = min((uint32_t)avail, chunk_len - total_received);
-                to_read = min((uint32_t)2048, (uint32_t)to_read);
-                to_read = (to_read / 4) * 4;
-                if (to_read == 0) { delay(1); continue; }
-                int got = client.readBytes((char*)stream_buf, to_read);
-                if (got > 0) {
-                  size_t wr = 0;
-                  i2s_write(I2S_SPK_PORT, stream_buf, got, &wr, portMAX_DELAY);
-                  total_received += got;
-                  start_recv = millis();
-                  lastChunkTime = millis();
-                }
-              } else {
-                delay(1);
-                if (millis() - start_recv > 3000) {
-                  Serial.println("[CHUNK] ⚠️ Timeout waiting for chunk data!");
-                  break;
-                }
+            int got = client.readBytes((char*)mono_buf, to_read);
+            if (got > 0) {
+              int16_t stereo_buf[1024];
+              int16_t* mono_samples = (int16_t*)mono_buf;
+              int samples = got / 2;
+              for (int i = 0; i < samples; i++) {
+                stereo_buf[i * 2]     = mono_samples[i];
+                stereo_buf[i * 2 + 1] = mono_samples[i];
               }
-              renderEyes();
+              size_t wr = 0;
+              i2s_write(I2S_SPK_PORT, stereo_buf, samples * 4, &wr, portMAX_DELAY);
+              total_got += got;
             }
           } else {
-            // chunk_len == 0 signals End of Audio Stream
-            // Smoothly push zeros through DMA to flush remaining audio and prevent speaker pop/radio clicks
-            uint8_t zero_flush[2048] = {0};
-            for (int z = 0; z < 4; z++) {
-              size_t zwr = 0;
-              i2s_write(I2S_SPK_PORT, zero_flush, sizeof(zero_flush), &zwr, portMAX_DELAY);
-            }
-            delay(250); // Allow hardware DMA to clock out the zero tail cleanly
-            isSpeaking = false;
-            eyes.setEmotion(postSpeechEmotion);
-            emotionHoldUntil = millis() + 3500;
-            lastSpeechTime = millis();
-            Serial.println("[CHUNK] Streaming audio finished.");
+            delay(1);
           }
         }
-      }
-
-      // ── AUDIO COMMAND (Download into PSRAM & play with animated eyes) ──────
-      else if (strcmp(header_peek, "AUDIO") == 0) {
-        while (client.connected() && client.available() < 4) {
-          renderEyes();
-          delay(1);
-        }
-
-        uint8_t len_buf[4];
-        client.readBytes(len_buf, 4);
-        uint32_t audio_len = ((uint32_t)len_buf[0] << 24) |
-                             ((uint32_t)len_buf[1] << 16) |
-                             ((uint32_t)len_buf[2] << 8)  |
-                              (uint32_t)len_buf[3];
-        Serial.printf("[AUDIO] Ingesting %u bytes mono PCM...\n", audio_len);
-
-        isSpeaking = true;
-        eyes.setEmotion(EMOTION_SPEAKING);
-
-        bool use_psram = (audio_psram_buf != nullptr && audio_len <= AUDIO_BUF_SIZE);
-
-        if (use_psram) {
-          uint32_t total_received = 0;
-          uint32_t play_offset = 0;
-          uint8_t* play_buf = audio_psram_buf;
-          unsigned long start_recv = millis();
-          bool playback_started = false;
-          const uint32_t PREBUFFER_BYTES = 6144; // ~192ms of 16kHz mono (instant start!)
-
-          while ((play_offset < audio_len) && (client.connected() || total_received > play_offset)) {
-            // 1. Ingest newly arrived TCP bytes directly into PSRAM
-            if (total_received < audio_len && client.connected()) {
-              int avail = client.available();
-              if (avail > 0) {
-                int to_read = min((uint32_t)avail, audio_len - total_received);
-                int got = client.read(play_buf + total_received, to_read);
-                if (got > 0) {
-                  total_received += got;
-                  start_recv = millis();
-                }
-              }
-            }
-
-            // 2. Start playback as soon as pre-buffer threshold is reached
-            if (!playback_started) {
-              if (total_received >= PREBUFFER_BYTES || total_received >= audio_len) {
-                playback_started = true;
-                Serial.printf("[AUDIO] ⚡ Pre-buffer ready (%u bytes). Starting speaker NOW!\n", total_received);
-              } else {
-                delay(1);
-                if (millis() - start_recv > 6000) {
-                  Serial.println("[AUDIO] ⚠️ Timeout waiting for pre-buffer!");
-                  break;
-                }
-                continue;
-              }
-            }
-
-            // 3. Play available chunks and expand Mono -> Stereo on the fly
-            uint32_t unplayed = total_received - play_offset;
-            if (unplayed >= 1024 || (total_received >= audio_len && unplayed > 0)) {
-              size_t mono_chunk = min((uint32_t)1024, unplayed);
-              mono_chunk = (mono_chunk / 2) * 2; // ensure 16-bit sample alignment
-              if (mono_chunk > 0) {
-                // Expand Mono -> Stereo into stack buffer for MAX98357A I2S DAC
-                int16_t stereo_buf[1024]; // 2048 bytes (512 L + 512 R samples)
-                int16_t* mono_samples = (int16_t*)(play_buf + play_offset);
-                int samples = mono_chunk / 2;
-                for (int i = 0; i < samples; i++) {
-                  stereo_buf[i * 2]     = mono_samples[i];
-                  stereo_buf[i * 2 + 1] = mono_samples[i];
-                }
-                size_t written = 0;
-                i2s_write(I2S_SPK_PORT, stereo_buf, samples * 4, &written, portMAX_DELAY);
-                play_offset += mono_chunk;
-              }
-              renderEyes();
-            } else if (total_received < audio_len) {
-              delay(1);
-              if (millis() - start_recv > 6000) {
-                Serial.println("[AUDIO] ⚠️ Timeout waiting for audio stream!");
-                break;
-              }
-            } else {
-              break;
-            }
-          }
-
-          Serial.printf("[AUDIO] Finished playing %u / %u bytes.\n", play_offset, audio_len);
-
-        } else {
-          // Direct fallback streaming
-          uint32_t total_received = 0;
-          uint8_t mono_buf[1024];
-          while (total_received < audio_len && client.connected()) {
-            int avail = client.available();
-            if (avail > 0) {
-              int to_read = min((uint32_t)avail, audio_len - total_received);
-              to_read = min((uint32_t)1024, (uint32_t)to_read);
-              to_read = (to_read / 2) * 2;
-              if (to_read == 0) { delay(1); continue; }
-              int got = client.readBytes((char*)mono_buf, to_read);
-              if (got > 0) {
-                int16_t stereo_buf[1024];
-                int16_t* mono_samples = (int16_t*)mono_buf;
-                int samples = got / 2;
-                for (int i = 0; i < samples; i++) {
-                  stereo_buf[i * 2]     = mono_samples[i];
-                  stereo_buf[i * 2 + 1] = mono_samples[i];
-                }
-                size_t wr = 0;
-                i2s_write(I2S_SPK_PORT, stereo_buf, samples * 4, &wr, portMAX_DELAY);
-                total_received += got;
-              }
-            } else delay(1);
-            renderEyes();
-          }
-        }
-
-        // Push silence zeros to cleanly settle DAC and allow DMA queue to finish clocking out
-        uint8_t zero_flush[2048] = {0};
-        for (int z = 0; z < 4; z++) {
+      } else {
+        // chunk_len == 0 -> End of streaming
+        uint8_t zero_flush[1024] = {0};
+        for (int z = 0; z < 2; z++) {
           size_t zwr = 0;
           i2s_write(I2S_SPK_PORT, zero_flush, sizeof(zero_flush), &zwr, portMAX_DELAY);
         }
-        delay(250);
+        delay(150);
         isSpeaking = false;
+        strncpy(robotStatusText, "MEMO Ready", sizeof(robotStatusText) - 1);
+      }
+    }
 
-        // Transition to post-speech emotion (e.g. Happy ^ ^)
-        eyes.setEmotion(postSpeechEmotion);
-        emotionHoldUntil = millis() + 3500;
-        lastSpeechTime = millis();
+    // ── AUDIO COMMAND (Direct Instant Speaker Playback) ─────────────────────
+    else if (strcmp(header_peek, "AUDIO") == 0) {
+      while (client.connected() && client.available() < 4) delay(1);
+
+      uint8_t len_buf[4];
+      client.readBytes(len_buf, 4);
+      uint32_t audio_len = ((uint32_t)len_buf[0] << 24) |
+                           ((uint32_t)len_buf[1] << 16) |
+                           ((uint32_t)len_buf[2] << 8)  |
+                            (uint32_t)len_buf[3];
+      Serial.printf("[AUDIO] Ingesting %u bytes mono PCM...\n", audio_len);
+
+      isSpeaking = true;
+      strncpy(robotStatusText, "AI Speaking...", sizeof(robotStatusText) - 1);
+
+      uint32_t total_received = 0;
+      uint8_t mono_buf[1024];
+      int16_t stereo_buf[1024];
+      unsigned long start_recv = millis();
+
+      while (total_received < audio_len && client.connected()) {
+        int avail = client.available();
+        if (avail > 0) {
+          int to_read = min((uint32_t)avail, audio_len - total_received);
+          to_read = min((uint32_t)1024, (uint32_t)to_read);
+          to_read = (to_read / 2) * 2;
+          if (to_read == 0) { delay(1); continue; }
+
+          int got = client.readBytes((char*)mono_buf, to_read);
+          if (got > 0) {
+            int16_t* mono_samples = (int16_t*)mono_buf;
+            int samples = got / 2;
+            for (int i = 0; i < samples; i++) {
+              stereo_buf[i * 2]     = mono_samples[i];
+              stereo_buf[i * 2 + 1] = mono_samples[i];
+            }
+            size_t written = 0;
+            i2s_write(I2S_SPK_PORT, stereo_buf, samples * 4, &written, portMAX_DELAY);
+            total_received += got;
+            start_recv = millis();
+          }
+        } else {
+          delay(1);
+          if (millis() - start_recv > 5000) break;
+        }
       }
 
-      else {
-        Serial.printf("[TCP] Unknown header: [%s]\n", header_peek);
+      Serial.printf("[AUDIO] Playback complete (%u / %u bytes)\n", total_received, audio_len);
+
+      uint8_t zero_flush[1024] = {0};
+      for (int z = 0; z < 2; z++) {
+        size_t zwr = 0;
+        i2s_write(I2S_SPK_PORT, zero_flush, sizeof(zero_flush), &zwr, portMAX_DELAY);
       }
+      delay(150);
+      isSpeaking = false;
+      strncpy(robotStatusText, "MEMO Ready", sizeof(robotStatusText) - 1);
     }
   }
 
-  // 3. CONTINUOUS MICROPHONE CAPTURE & LOCAL INTELLIGENCE
-  // Runs whether PC is connected or disconnected!
-  if (!isSpeaking && mic_buf) {
+  // 3. CONTINUOUS MICROPHONE CAPTURE & DIRECT STREAMING TO PC
+  // (Exact proven non-blocking logic of commit 3f29f20 — timeout = 0)
+  if (!isSpeaking) {
     size_t bytesIn = 0;
-    esp_err_t result = i2s_read(I2S_PORT, mic_buf, MIC_BUF_SAMPLES * sizeof(int16_t), &bytesIn, 0);
+    esp_err_t result = i2s_read(I2S_PORT, mic_buf, sizeof(mic_buf), &bytesIn, 0);
     if (result == ESP_OK && bytesIn > 0) {
       int samples = bytesIn / sizeof(int16_t);
 
-      int64_t sum_squares = 0;
-      int16_t peak = 0;
-
       for (int i = 0; i < samples; i++) {
         int32_t s = (int32_t)mic_buf[i] * MIC_GAIN;
-        s = constrain(s, -32768, 32767);
-        mic_buf[i] = (int16_t)s;
-
-        int16_t abs_s = abs(mic_buf[i]);
-        if (abs_s > peak) peak = abs_s;
-        sum_squares += (int32_t)mic_buf[i] * (int32_t)mic_buf[i];
+        mic_buf[i] = (int16_t)constrain(s, -32768, 32767);
       }
 
-      float rms = sqrtf((float)(sum_squares / samples));
+      // Update FFT waveform buffer for Core 0 display task
+      if (samples <= FFT_SAMPLES) {
+        memcpy(fft_wave, mic_buf, samples * sizeof(int16_t));
+      }
 
-      // Forward to TCP server if connected
+      // Forward directly to TCP server if connected
       if (client.connected()) {
-        client.write((uint8_t*)mic_buf, samples * sizeof(int16_t));
+        client.write((uint8_t*)mic_buf, bytesIn);
       }
-
-      // Run Local Sound Intelligence on the ESP32!
-      processLocalAudio(rms, peak, now);
     }
-  }
-
-  // 4. Emotion Hold Timer (reverts to Neutral after reactions)
-  if (emotionHoldUntil > 0 && now > emotionHoldUntil && !isSpeaking) {
-    if (!isSleepy) {
-      eyes.setEmotion(EMOTION_NEUTRAL);
-    }
-    emotionHoldUntil = 0;
   }
 
   // Safety watchdog: reset speaking state if no chunk received for 6 seconds
   if (isSpeaking && (now - lastChunkTime > 6000)) {
     isSpeaking = false;
-    eyes.setEmotion(EMOTION_NEUTRAL);
-    Serial.println("[CHUNK] ⚠️ Safety watchdog: reset speaking state");
+    strncpy(robotStatusText, "MEMO Ready", sizeof(robotStatusText) - 1);
   }
-
-  // 5. MPU6050 Gyro Tilt & Shake Handling
-  if (mpuAvailable && !isSpeaking && (eyes.getEmotion() == EMOTION_NEUTRAL || eyes.getEmotion() == EMOTION_HAPPY)) {
-    static unsigned long lastImuRead = 0;
-    if (now - lastImuRead > 35) {
-      lastImuRead = now;
-      sensors_event_t a, g, temp;
-      mpu.getEvent(&a, &g, &temp);
-
-      float totalAccel = sqrtf(a.acceleration.x * a.acceleration.x +
-                               a.acceleration.y * a.acceleration.y +
-                               a.acceleration.z * a.acceleration.z);
-      if (totalAccel > 22.0f && eyes.getEmotion() != EMOTION_DIZZY) {
-        eyes.setEmotion(EMOTION_DIZZY);
-        emotionHoldUntil = now + 3000;
-        isSleepy = false;
-        lastSpeechTime = now;
-      } else {
-        int8_t gazeX = constrain((int)(-a.acceleration.y * 2.2f), -14, 14);
-        int8_t gazeY = constrain((int)(a.acceleration.x * 2.2f), -8, 8);
-        eyes.look(gazeX, gazeY);
-      }
-    }
-  }
-
-  // 6. Always Keep Eyes Animating at ~45 FPS
-  renderEyes();
 }

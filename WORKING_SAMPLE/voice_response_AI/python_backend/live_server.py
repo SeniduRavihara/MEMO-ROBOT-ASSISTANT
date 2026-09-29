@@ -285,9 +285,6 @@ except Exception as e:
 # ── STEP 1: Speech-to-Text (audio → transcript) ──────────────────────────
 def transcribe_audio(audio_bytes):
     """Fast local STT using Whisper. Falls back to Gemini if Whisper unavailable."""
-    # Trim silence to reduce processing
-    audio_bytes = trim_silence_pcm(audio_bytes)
-    
     # Try local Whisper first (fast, free, no network)
     if whisper_model:
         try:
@@ -296,6 +293,11 @@ def transcribe_audio(audio_bytes):
             pcm_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
             audio_float32 = pcm_int16.astype(np.float32) / 32768.0
             
+            # Peak-normalize to 0.95 so Whisper always receives optimal volume even when quiet
+            peak_val = np.max(np.abs(audio_float32))
+            if peak_val > 0.001:
+                audio_float32 = (audio_float32 / peak_val) * 0.95
+            
             lang_code = "si" if "si" in current_language else "en"
             segments, info = whisper_model.transcribe(
                 audio_float32,
@@ -303,6 +305,7 @@ def transcribe_audio(audio_bytes):
                 language=lang_code,
                 condition_on_previous_text=False,
                 temperature=0.0,
+                vad_filter=False,
             )
             transcript = " ".join([seg.text.strip() for seg in segments]).strip()
             elapsed = int((time.time() - t0) * 1000)
@@ -624,10 +627,10 @@ def audio_listener_loop(active_loop, target_ip):
             silence_start = 0
             speech_start_time = 0
             phrase_buffer = bytearray()
-            # 300ms Pre-Roll Ring Buffer (10 chunks * ~32ms = ~320ms)
-            pre_roll_buffer = collections.deque(maxlen=10)
-            # Adaptive Noise Floor (Realistic default for room environment)
-            noise_floor_rms = 700.0
+            # 500ms Pre-Roll Ring Buffer (16 chunks * ~32ms = ~512ms ensures zero clipped first words)
+            pre_roll_buffer = collections.deque(maxlen=16)
+            # Adaptive Noise Floor (Calibrated on connect)
+            noise_floor_rms = 400.0
             
             # Software AGC (Automatic Gain Control) state
             agc_gain = 1.0
@@ -635,6 +638,7 @@ def audio_listener_loop(active_loop, target_ip):
             
             loud_chunk_count = 0
             calibration_chunks = 15  # Discard initial socket pops and calibrate true ambient floor
+            last_heartbeat = 0
             
             while True:
                 chunk = sock.recv(1024)
@@ -659,6 +663,11 @@ def audio_listener_loop(active_loop, target_ip):
                     pre_roll_buffer.append(chunk)
                     continue
                 
+                # Heartbeat to give real-time visibility into incoming mic stream
+                if not is_speaking and (time.time() - last_heartbeat > 2.5):
+                    last_heartbeat = time.time()
+                    print(f"[Mic Audio] 🟢 Ingesting audio: RMS={rms:.0f} | NoiseFloor={noise_floor_rms:.0f} | StartTrigger={max(100.0, noise_floor_rms * 2.0):.0f}")
+                
                 # Calculate dynamic AGC gain during speech
                 if rms > 0 and is_speaking:
                     ideal_gain = TARGET_SPEECH_RMS / rms
@@ -670,26 +679,26 @@ def audio_listener_loop(active_loop, target_ip):
                 scaled_chunk = apply_agc(chunk, agc_gain)
                 
                 # Update adaptive noise floor when silent, ONLY during quiet periods
-                if not is_speaking and rms < noise_floor_rms * 1.3:
-                    noise_floor_rms = 0.98 * noise_floor_rms + 0.02 * rms
-                    noise_floor_rms = max(150.0, min(noise_floor_rms, 1200.0))
+                if not is_speaking and rms < noise_floor_rms * 1.5:
+                    noise_floor_rms = 0.95 * noise_floor_rms + 0.05 * rms
+                    noise_floor_rms = max(20.0, min(noise_floor_rms, 600.0))
                 
-                # Dual VAD Thresholds:
-                start_threshold = max(650.0, noise_floor_rms * 1.45)
-                silence_threshold = max(450.0, noise_floor_rms * 1.20)
+                # Dual VAD Thresholds (Dynamic based on true ambient room noise):
+                start_threshold = max(100.0, noise_floor_rms * 2.2)
+                silence_threshold = max(50.0, noise_floor_rms * 1.4)
                 
                 if not is_speaking:
+                    pre_roll_buffer.append(scaled_chunk)
                     if rms > start_threshold:
                         loud_chunk_count += 1
-                        # Require 3 consecutive loud chunks (~96ms) to debounce clicks and noise spikes
-                        if loud_chunk_count >= 3:
+                        # Require 2 consecutive loud chunks (~64ms) to debounce clicks
+                        if loud_chunk_count >= 2:
                             is_speaking = True
                             speech_start_time = time.time()
                             silence_start = 0
-                            # Include 300ms pre-roll buffer so initial quiet syllables aren't cut off
+                            # Include full 500ms pre-roll lead-in so initial consonants ("Can", "Look") are never cut off
                             phrase_buffer.extend(b"".join(pre_roll_buffer))
                             pre_roll_buffer.clear()
-                            phrase_buffer.extend(scaled_chunk)
                             print(f"[VAD] 🎙️ Speech detected! (RMS: {rms:.0f}, Threshold: {start_threshold:.0f})")
                             # Instant display feedback on ESP32 screen
                             with socket_lock:
@@ -699,7 +708,6 @@ def audio_listener_loop(active_loop, target_ip):
                             asyncio.run_coroutine_threadsafe(broadcast("LISTENING_START"), active_loop)
                     else:
                         loud_chunk_count = 0
-                        pre_roll_buffer.append(scaled_chunk)
                 else:
                     # DURING SPEECH: Record every syllable smoothly!
                     phrase_buffer.extend(scaled_chunk)
@@ -745,6 +753,16 @@ def audio_listener_loop(active_loop, target_ip):
                                     # Discard noise blips under 0.35s (less than 11,000 bytes)
                                     if len(buf) < 11000:
                                         return
+                                    
+                                    # Save last capture for inspection/playback
+                                    try:
+                                        with wave.open("last_capture.wav", "wb") as wf:
+                                            wf.setnchannels(1)
+                                            wf.setsampwidth(2)
+                                            wf.setframerate(SAMPLE_RATE)
+                                            wf.writeframes(buf)
+                                    except Exception:
+                                        pass
                                     
                                     # STEP 1: Fast Local STT (audio → text via Whisper)
                                     user_transcript = transcribe_audio(buf)
