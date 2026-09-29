@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import time
 import struct
 import socket
@@ -7,11 +8,13 @@ import collections
 import math
 import asyncio
 import threading
+import concurrent.futures
 import wave
 import tempfile
 import numpy as np
 import edge_tts
 from pydub import AudioSegment
+import builtins
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 from google import genai
@@ -22,57 +25,125 @@ from fastapi.responses import HTMLResponse
 
 load_dotenv()
 
+# --- TIMESTAMP PRINT WRAPPER ---
+_orig_print = builtins.print
+turn_start_time = None
+
+def tprint(*args, **kwargs):
+    if not args:
+        _orig_print(**kwargs)
+        return
+    if turn_start_time is not None:
+        elapsed = time.time() - turn_start_time
+        prefix = f"[+{elapsed:.2f}s] "
+    else:
+        prefix = f"[{time.strftime('%H:%M:%S')}] "
+
+    sep = kwargs.pop("sep", " ")
+    first = str(args[0])
+    newlines = len(first) - len(first.lstrip("\n"))
+    if newlines > 0:
+        prefix = ("\n" * newlines) + prefix
+        args = (first.lstrip("\n"),) + args[1:]
+
+    msg = sep.join(str(a) for a in args)
+    _orig_print(prefix + msg, **kwargs)
+
+builtins.print = tprint
+
 # --- AI CONFIGURATION ---
 raw_keys = os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", ""))
-API_KEYS = [k.strip() for k in raw_keys.split(",") if len(k.strip()) > 20]
-if not API_KEYS:
+all_keys = [k.strip() for k in raw_keys.split(",") if len(k.strip()) > 20]
+if not all_keys:
     raise ValueError("No valid GEMINI_API_KEYS found in .env!")
 
-# Pre-initialize clients for all keys in the pool
-api_clients = [genai.Client(api_key=k) for k in API_KEYS]
-current_key_idx = 0
-key_lock = threading.Lock()
+# Prioritize direct AIzaSy keys first, secondary keys last
+API_KEYS = sorted(all_keys, key=lambda k: 0 if k.startswith("AIzaSy") else 1)
 
-print(f"🔑 Loaded {len(API_KEYS)} Gemini API Key(s) into Round-Robin pool!")
-for idx, k in enumerate(API_KEYS):
-    print(f"   [Key #{idx + 1}] {k[:10]}...{k[-4:]}")
-
-def get_round_robin_client():
-    """Rotate to the next key on each conversation turn for even load distribution."""
-    global current_key_idx
-    with key_lock:
-        client = api_clients[current_key_idx]
-        idx = current_key_idx
-        current_key_idx = (current_key_idx + 1) % len(API_KEYS)
-        return client, idx
-
-def get_next_client(idx_to_skip):
-    """If a specific key hits quota (429), failover to the next key."""
-    with key_lock:
-        next_idx = (idx_to_skip + 1) % len(API_KEYS)
-        return api_clients[next_idx], next_idx
-
-ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a small AI robot with a tiny screen. You are having a live voice chat.
-RULES:
-- Reply in 1 SHORT sentence only (max 15 words). Never write long answers.
-- You understand Sinhala, Singlish, and English. Always reply in English.
-- Be warm and natural. Skip filler like "Sure!", "Of course!", "Great question!".
-- NEVER say "How can I help you?" or "Is there anything else?" — just answer directly.
-- NEVER claim you only understand English or refuse non-English input."""
-
-# Models to try in order - fallback if one is rate-limited
-MODELS_TO_TRY = [
+CANDIDATE_MODELS = [
+    'gemini-3.5-flash-lite',
     'gemini-flash-lite-latest',
-    'gemini-3.1-flash-lite',
-    'gemini-3.5-flash',
+    'gemini-3.6-flash',
     'gemini-2.5-flash',
 ]
+
+verified_pool = []
+key_lock = threading.Lock()
+current_pool_idx = 0
+key_cooldowns = {}  # {pool_index: cooldown_expiry_timestamp}
+
+print(f"🔍 Pre-flight auditing {len(API_KEYS)} Gemini key(s) to verify active models...")
+
+def audit_single_key(idx, key_str):
+    client = genai.Client(api_key=key_str)
+    for model in CANDIDATE_MODELS:
+        try:
+            client.models.generate_content(model=model, contents=["ping"])
+            return {
+                "idx": idx,
+                "client": client,
+                "model": model,
+                "key_str": key_str,
+                "label": f"Key #{idx + 1} ({key_str[:8]}...{key_str[-4:]})"
+            }
+        except Exception:
+            continue
+    return None
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=len(API_KEYS)) as executor:
+    futures = [executor.submit(audit_single_key, i, k) for i, k in enumerate(API_KEYS)]
+    for f in concurrent.futures.as_completed(futures):
+        res = f.result()
+        if res:
+            verified_pool.append(res)
+            print(f"   ✅ {res['label']} -> Locked to [{res['model']}]")
+        else:
+            print(f"   ⚠️ Key excluded: no compatible models found.")
+
+verified_pool.sort(key=lambda item: item["idx"])
+
+if not verified_pool:
+    # Emergency fallback
+    for i, k in enumerate(API_KEYS):
+        verified_pool.append({
+            "idx": i,
+            "client": genai.Client(api_key=k),
+            "model": "gemini-3.5-flash-lite",
+            "key_str": k,
+            "label": f"Key #{i + 1}"
+        })
+
+print(f"🚀 AI Pool ready: {len(verified_pool)} verified key(s) active!\n")
+
+def get_next_healthy_entry(start_idx=None):
+    """Select the next key in the pool that is not cooling down."""
+    global current_pool_idx
+    now = time.time()
+    with key_lock:
+        if start_idx is None:
+            start_idx = current_pool_idx
+            current_pool_idx = (current_pool_idx + 1) % len(verified_pool)
+        for i in range(len(verified_pool)):
+            candidate_idx = (start_idx + i) % len(verified_pool)
+            if key_cooldowns.get(candidate_idx, 0) <= now:
+                return verified_pool[candidate_idx], candidate_idx
+        best_idx = min(key_cooldowns.keys(), key=lambda idx: key_cooldowns[idx]) if key_cooldowns else 0
+        return verified_pool[best_idx], best_idx
+ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a friendly little AI robot with a tiny screen. You are having a live voice chat.
+RULES:
+- Reply in 1 SHORT sentence only (max 12 words). Never write long answers.
+- Speak naturally and warmly in plain words only.
+- NEVER use asterisks (*), underscores (_), markdown formatting, emojis, or sound actions like *beep boop* or *zoom*. Output plain spoken English words only.
+- You understand Sinhala, Singlish, and English. Always reply in English.
+- Skip filler like "Sure!", "Of course!", "Great question!".
+- NEVER say "How can I help you?" or "Is there anything else?" — just answer directly.
+- NEVER claim you only understand English or refuse non-English input."""
 
 # --- NETWORK CONFIGURATION ---
 TCP_PORT = 8005
 SAMPLE_RATE = 16000
 SILENCE_THRESHOLD = 200  # Lower = more sensitive mic detection
-MAX_SILENCE_SECONDS = 0.35  # Seconds of silence before sending to Gemini (shorter = faster response)
+MAX_SILENCE_SECONDS = 0.65  # Seconds of silence before sending to Gemini (0.65s gives natural pause)
 
 app = FastAPI(title="Gemini AI Robot")
 
@@ -82,6 +153,7 @@ current_language = "en-US"
 robot_socket = None
 socket_lock = threading.Lock()
 is_processing_ai = False
+mic_ignore_until = 0
 conversation_history = collections.deque(maxlen=6)
 
 html = """
@@ -182,8 +254,8 @@ def apply_agc(audio_bytes, gain):
         scaled.append(val)
     return struct.pack(f"<{count}h", *scaled)
 
-def trim_silence_pcm(audio_bytes, threshold=150, frame_size=640):
-    """Strip leading/trailing silent frames from 16-bit PCM to reduce upload payload.
+def trim_silence_pcm(audio_bytes, threshold=220, frame_size=640):
+    """Strip leading/trailing silent frames from 16-bit PCM without cutting spoken words.
     frame_size=640 bytes = 320 samples = 20ms at 16kHz."""
     if len(audio_bytes) < frame_size:
         return audio_bytes
@@ -258,6 +330,8 @@ def transcribe_audio(audio_bytes):
                 audio_float32,
                 beam_size=1,
                 language=lang_code,
+                condition_on_previous_text=False,
+                temperature=0.0,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=200),
             )
@@ -280,11 +354,11 @@ def transcribe_audio(audio_bytes):
         wf.writeframes(audio_bytes)
     wav_bytes = wav_io.getvalue()
     
-    for model_name in MODELS_TO_TRY:
+    for entry in verified_pool:
         try:
             t0 = time.time()
-            response = gemini_client.models.generate_content(
-                model=model_name,
+            response = entry["client"].models.generate_content(
+                model=entry["model"],
                 contents=[
                     types.Part.from_bytes(data=wav_bytes, mime_type='audio/wav'),
                     "Transcribe the spoken words in this audio. The speaker may use Sinhala, Singlish, or English. "
@@ -302,12 +376,12 @@ def transcribe_audio(audio_bytes):
             )
             elapsed = int((time.time() - t0) * 1000)
             transcript = response.text.strip()
-            print(f"[STT] ({elapsed}ms, {model_name}) → \"{transcript}\"")
+            print(f"[STT] ({elapsed}ms, {entry['model']}, {entry['label']}) → \"{transcript}\"")
             if not transcript or "[SILENCE]" in transcript:
                 return ""
             return transcript
         except Exception as e:
-            print(f"[STT {model_name}] error: {e}")
+            print(f"[STT {entry['label']}] error: {e}")
             if "429" not in str(e):
                 time.sleep(0.2)
     return ""
@@ -363,7 +437,7 @@ def ask_gemini_audio(audio_bytes):
 
 # ── STEP 2: Text-to-Response (transcript → AI reply) ─────────────────────
 def ask_gemini_text(user_transcript):
-    """Fast text-only LLM call with Round-Robin key rotation across turns and 429 failover."""
+    """Fast text-only LLM call using verified key & model pool with instant failover."""
     last_error = None
     
     # Build conversation context for continuity
@@ -375,49 +449,62 @@ def ask_gemini_text(user_transcript):
     
     prompt = f"{context}User said: \"{user_transcript}\"\nReply in 1 short sentence (max 15 words)."
     
-    # Grab the next key in round-robin sequence for this turn
-    client, key_idx = get_round_robin_client()
+    entry, pool_idx = get_next_healthy_entry()
     
-    total_key_attempts = len(API_KEYS)
-    for _ in range(total_key_attempts):
-        for model_name in MODELS_TO_TRY:
-            try:
-                t0 = time.time()
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[prompt],
-                    config=types.GenerateContentConfig(
-                        system_instruction=ROBOT_SYSTEM_INSTRUCTION,
-                        max_output_tokens=60,
-                        safety_settings=[
-                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
-                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
-                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-                        ]
-                    )
-                )
-                elapsed = int((time.time() - t0) * 1000)
-                ai_text = response.text.strip()
-                print(f"[LLM] ({elapsed}ms, {model_name}, Key #{key_idx + 1}) → \"{ai_text[:80]}...\"")
+    def do_call(c, m):
+        return c.models.generate_content(
+            model=m,
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                system_instruction=ROBOT_SYSTEM_INSTRUCTION,
+                max_output_tokens=60,
+                safety_settings=[
+                    types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                    types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+                    types.SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                    types.SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                ]
+            )
+        )
+    
+    for _ in range(len(verified_pool)):
+        client = entry["client"]
+        model_name = entry["model"]
+        label = entry["label"]
+        try:
+            t0 = time.time()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(do_call, client, model_name)
+                response = future.result(timeout=6.0)
+            
+            elapsed = int((time.time() - t0) * 1000)
+            ai_text = response.text.strip() if response.text else "I hear you."
+            print(f"[LLM] ({elapsed}ms, {model_name}, {label}) → \"{ai_text[:80]}\"")
+            
+            conversation_history.append(("User", user_transcript))
+            conversation_history.append(("MEMO", ai_text))
+            return ai_text
+        except concurrent.futures.TimeoutError:
+            print(f"[LLM Timeout] {label} took >6.0s! Putting on 60s cooldown...")
+            key_cooldowns[pool_idx] = time.time() + 60
+            entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
+        except Exception as e:
+            err_str = str(e)
+            last_error = e
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                print(f"[KeyManager] ⚠️ {label} quota limit reached. Switching to next key...")
+                key_cooldowns[pool_idx] = time.time() + 60
+                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
+            elif "503" in err_str:
+                print(f"[KeyManager] ⚠️ {label} Google high demand (503). Switching to next key...")
+                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
+            else:
+                print(f"[LLM Error] {label}: {e}. Switching to next key...")
+                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
+                time.sleep(0.05)
                 
-                # Save to conversation history
-                conversation_history.append(("User", user_transcript))
-                conversation_history.append(("MEMO", ai_text))
-                return ai_text
-            except Exception as e:
-                err_str = str(e)
-                print(f"[LLM {model_name}, Key #{key_idx + 1}] error: {e}")
-                last_error = e
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    print(f"[KeyManager] ⚠️ Key #{key_idx + 1} hit quota! Failing over to next key...")
-                    client, key_idx = get_next_client(key_idx)
-                    break  # Break inner model loop to retry with newly selected key
-                elif "404" in err_str and "no longer available" in err_str:
-                    continue  # Model not supported on this key, try next model in MODELS_TO_TRY
-                else:
-                    time.sleep(0.1)
-    raise last_error
+    print(f"[LLM] ⚠️ All Gemini keys failed or timed out: {last_error}. Using fallback response.")
+    return "I had a connection delay, could you say that again?"
 
 async def broadcast(msg):
     # Also include the robot_socket if we want to log to robot Serial
@@ -441,7 +528,7 @@ def text_to_pcm(text):
     return asyncio.run(run())
 
 def text_to_pcm_fast(text):
-    """Local piper-tts TTS (~300-500ms). Falls back to edge-tts if piper not available."""
+    """Local piper-tts TTS (~300-500ms). Natural Amy voice."""
     if piper_voice:
         try:
             t0 = time.time()
@@ -465,7 +552,7 @@ def text_to_pcm_fast(text):
 
 
 def speak_on_socket(pcm_data):
-    """Send a 4-byte length header + raw PCM data to the shared robot socket."""
+    """Send a 4-byte length header + raw PCM data to the shared robot socket in one combined packet."""
     global robot_socket
     with socket_lock:
         if not robot_socket:
@@ -473,10 +560,9 @@ def speak_on_socket(pcm_data):
             return
         try:
             length = len(pcm_data)
-            # Big-endian length header
+            # Big-endian length header combined with payload to avoid packet fragmentation
             header = b'AUDIO' + struct.pack('>I', length)
-            robot_socket.sendall(header)
-            robot_socket.sendall(pcm_data)
+            robot_socket.sendall(header + pcm_data)
             print(f"[TTS] Sent {length} PCM bytes to robot speaker.")
         except Exception as e:
             print(f"[TTS] Send error: {e}")
@@ -514,16 +600,19 @@ def audio_listener_loop(active_loop, target_ip):
             agc_gain = 1.0
             TARGET_SPEECH_RMS = 3000.0
             
+            loud_chunk_count = 0
+            
             while True:
                 chunk = sock.recv(1024)
                 if not chunk: break
                 
-                if is_processing_ai:
-                    # Discard audio data while AI is processing to prevent overlapping requests
+                if is_processing_ai or time.time() < mic_ignore_until:
+                    # Discard audio data while AI is processing or during post-speech acoustic cooldown
                     phrase_buffer.clear()
                     pre_roll_buffer.clear()
                     is_speaking = False
                     silence_start = 0
+                    loud_chunk_count = 0
                     agc_gain = 1.0
                     continue
                 
@@ -543,32 +632,43 @@ def audio_listener_loop(active_loop, target_ip):
                 if not is_speaking:
                     noise_floor_rms = 0.95 * noise_floor_rms + 0.05 * rms
                 
-                # Dynamic VAD Threshold for Far-Field Listening (1.5x noise floor, minimum floor 300.0)
-                dynamic_threshold = max(300.0, noise_floor_rms * 1.5)
+                # Dynamic VAD Threshold for Intentional Speech (sensitive to human voice, speaker echo blocked by cooldown)
+                dynamic_threshold = max(380.0, noise_floor_rms * 1.6)
                 
-                if rms > dynamic_threshold:
-                    if not is_speaking:
-                        is_speaking = True
-                        # Include 300ms pre-roll buffer so initial quiet syllables aren't cut off
-                        phrase_buffer.extend(b"".join(pre_roll_buffer))
-                        pre_roll_buffer.clear()
-                        # Instant display feedback on ESP32 screen
-                        with socket_lock:
-                            if robot_socket:
-                                try: robot_socket.sendall(b"TEXT:Listening...\n")
-                                except: pass
-                        asyncio.run_coroutine_threadsafe(broadcast("LISTENING_START"), active_loop)
-                    phrase_buffer.extend(scaled_chunk)
-                    silence_start = 0
-                else:
-                    if not is_speaking:
-                        pre_roll_buffer.append(scaled_chunk)
+                if not is_speaking:
+                    if rms > dynamic_threshold:
+                        loud_chunk_count += 1
+                        # Require 2 consecutive loud chunks (~64ms) to debounce clicks
+                        if loud_chunk_count >= 2:
+                            is_speaking = True
+                            # Include 300ms pre-roll buffer so initial quiet syllables aren't cut off
+                            phrase_buffer.extend(b"".join(pre_roll_buffer))
+                            pre_roll_buffer.clear()
+                            phrase_buffer.extend(scaled_chunk)
+                            silence_start = 0
+                            # Instant display feedback on ESP32 screen
+                            with socket_lock:
+                                if robot_socket:
+                                    try: robot_socket.sendall(b"TEXT:Listening...\n")
+                                    except: pass
+                            asyncio.run_coroutine_threadsafe(broadcast("LISTENING_START"), active_loop)
                     else:
-                        phrase_buffer.extend(scaled_chunk)
-                        if silence_start == 0: silence_start = time.time()
+                        loud_chunk_count = 0
+                        pre_roll_buffer.append(scaled_chunk)
+                else:
+                    # DURING SPEECH: Never drop chunks! Record every syllable smoothly!
+                    phrase_buffer.extend(scaled_chunk)
+                    if rms > dynamic_threshold:
+                        silence_start = 0
+                    else:
+                        if silence_start == 0:
+                            silence_start = time.time()
                         elif time.time() - silence_start > MAX_SILENCE_SECONDS:
+                            global turn_start_time
+                            turn_start_time = time.time()
                             is_speaking = False
                             silence_start = 0
+                            loud_chunk_count = 0
                             pre_roll_buffer.clear() # Clear pre-roll buffer to prevent repeating previous phrase
                             # Instant status update on ESP32 screen when speech finishes
                             with socket_lock:
@@ -582,11 +682,17 @@ def audio_listener_loop(active_loop, target_ip):
                             lang_now = current_language
                             
                             def handle_ai(buf, lang, s):
-                                global is_processing_ai
+                                global is_processing_ai, turn_start_time
                                 is_processing_ai = True
-                                t_start = time.time()
+                                if turn_start_time is None:
+                                    turn_start_time = time.time()
+                                t_start = turn_start_time
                                 
                                 try:
+                                    # Discard noise blips under 0.35s (less than 11,000 bytes)
+                                    if len(buf) < 11000:
+                                        return
+                                    
                                     # STEP 1: Fast Local STT (audio → text via Whisper)
                                     user_transcript = transcribe_audio(buf)
 
@@ -610,11 +716,15 @@ def audio_listener_loop(active_loop, target_ip):
                                     total_ms = int((time.time() - t_start) * 1000)
                                     print(f"MEMO: {ai_text}  [{total_ms}ms total]")
 
-                                    # Send text to OLED
-                                    clean_text = ai_text.replace('\n', ' ').strip()
+                                    # Strip asterisks (*), markdown formatting, and emojis so Piper never says 'asterisk'
+                                    clean_text = re.sub(r'[*_#~`]', '', ai_text)
+                                    clean_text = clean_text.encode('ascii', 'ignore').decode('ascii')
+                                    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                                    
+                                    # Send clean text to OLED
                                     with socket_lock:
                                         s.sendall(("TEXT:" + clean_text + "\n").encode('utf-8'))
-                                    asyncio.run_coroutine_threadsafe(broadcast(f"AI:{ai_text}"), active_loop)
+                                    asyncio.run_coroutine_threadsafe(broadcast(f"AI:{clean_text}"), active_loop)
 
                                     # STEP 3: FAST Local TTS (Piper TTS ~300-500ms on CPU, no cloud)
                                     asyncio.run_coroutine_threadsafe(broadcast("STATUS:🔊 Speaking..."), active_loop)
@@ -625,14 +735,21 @@ def audio_listener_loop(active_loop, target_ip):
                                     # 16kHz 16-bit stereo = 64,000 bytes/sec
                                     if pcm:
                                         audio_duration = len(pcm) / 64000.0
-                                        time.sleep(audio_duration + 0.35)
+                                        # Extra buffer for large speaker cone decay & acoustic reverberation
+                                        time.sleep(audio_duration + 0.65)
                                 except Exception as e:
                                     print("Gemini voice pipeline failed:", e)
                                     asyncio.run_coroutine_threadsafe(broadcast("STATUS:❌ AI Error"), active_loop)
-                                    with socket_lock:
-                                        robot_socket = None
                                 finally:
+                                    # Set acoustic cooldown: discard residual large speaker echo from socket
+                                    global mic_ignore_until
+                                    mic_ignore_until = time.time() + 0.5
                                     is_processing_ai = False
+                                    turn_start_time = None
+                                    with socket_lock:
+                                        if robot_socket:
+                                            try: robot_socket.sendall(b"TEXT:MEMO Ready! Speak...\n")
+                                            except: pass
                                     asyncio.run_coroutine_threadsafe(broadcast("STATUS:✅ Speak."), active_loop)
 
                             active_loop.run_in_executor(None, handle_ai, buffer_copy, lang_now, sock)

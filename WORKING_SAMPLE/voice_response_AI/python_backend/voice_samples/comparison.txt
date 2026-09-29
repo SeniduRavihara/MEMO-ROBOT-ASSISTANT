@@ -1,0 +1,8 @@
+=========================================================================================================
+#    | Audio File | Time     | Length | Whisper Heard                    | Gemini Direct Voice
+=========================================================================================================
+1    | 1.wav    | 22:52:44 | 11.0s | the quick down for down over a   | the quick down for down over a little.
+2    | 2.wav    | 22:53:00 |  8.1s | What I do here about?            | What I do here about?
+3    | 3.wav    | 22:53:17 | 16.1s | Are you sure can you hear me c   | Are you sure can you hear me clearly?
+4    | 4.wav    | 22:53:29 |  3.2s | I am a family, too many girls    | I am a family, too many girls away from you.
+5    | 5.wav    | 22:53:46 | 12.7s | I am attending 2 meters away f   | I am attending 2 meters away from you.
