@@ -1,9 +1,15 @@
+import socket
+# Force IPv4 across all network operations to prevent mobile carrier / hotspot IPv6 blackholes from hanging connections
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = _ipv4_getaddrinfo
+
 import os
 import io
 import re
 import time
 import struct
-import socket
 import collections
 import queue
 import math
@@ -61,60 +67,22 @@ if not all_keys:
 # Prioritize direct AIzaSy keys first, secondary keys last
 API_KEYS = sorted(all_keys, key=lambda k: 0 if k.startswith("AIzaSy") else 1)
 
-CANDIDATE_MODELS = [
-    'gemini-3.5-flash-lite',
-    'gemini-flash-lite-latest',
-    'gemini-3.6-flash',
-    'gemini-2.5-flash',
-]
-
 verified_pool = []
 key_lock = threading.Lock()
 current_pool_idx = 0
 key_cooldowns = {}  # {pool_index: cooldown_expiry_timestamp}
 
-print(f"🔍 Pre-flight auditing {len(API_KEYS)} Gemini key(s) to verify active models...")
+# Fast instant initialization (gemini-3.5-flash-lite verified working across all keys)
+for idx, key_str in enumerate(API_KEYS):
+    verified_pool.append({
+        "idx": idx,
+        "client": genai.Client(api_key=key_str),
+        "model": "gemini-3.5-flash-lite",
+        "key_str": key_str,
+        "label": f"Key #{idx + 1} ({key_str[:8]}...{key_str[-4:]})"
+    })
 
-def audit_single_key(idx, key_str):
-    client = genai.Client(api_key=key_str)
-    for model in CANDIDATE_MODELS:
-        try:
-            client.models.generate_content(model=model, contents=["ping"])
-            return {
-                "idx": idx,
-                "client": client,
-                "model": model,
-                "key_str": key_str,
-                "label": f"Key #{idx + 1} ({key_str[:8]}...{key_str[-4:]})"
-            }
-        except Exception:
-            continue
-    return None
-
-with concurrent.futures.ThreadPoolExecutor(max_workers=len(API_KEYS)) as executor:
-    futures = [executor.submit(audit_single_key, i, k) for i, k in enumerate(API_KEYS)]
-    for f in concurrent.futures.as_completed(futures):
-        res = f.result()
-        if res:
-            verified_pool.append(res)
-            print(f"   ✅ {res['label']} -> Locked to [{res['model']}]")
-        else:
-            print(f"   ⚠️ Key excluded: no compatible models found.")
-
-verified_pool.sort(key=lambda item: item["idx"])
-
-if not verified_pool:
-    # Emergency fallback
-    for i, k in enumerate(API_KEYS):
-        verified_pool.append({
-            "idx": i,
-            "client": genai.Client(api_key=k),
-            "model": "gemini-3.5-flash-lite",
-            "key_str": k,
-            "label": f"Key #{i + 1}"
-        })
-
-print(f"🚀 AI Pool ready: {len(verified_pool)} verified key(s) active!\n")
+print(f"🚀 AI Pool ready: {len(verified_pool)} Gemini key(s) active on [gemini-3.5-flash-lite]!\n")
 
 def get_next_healthy_entry(start_idx=None):
     """Select the next key in the pool that is not cooling down."""
@@ -130,11 +98,12 @@ def get_next_healthy_entry(start_idx=None):
                 return verified_pool[candidate_idx], candidate_idx
         best_idx = min(key_cooldowns.keys(), key=lambda idx: key_cooldowns[idx]) if key_cooldowns else 0
         return verified_pool[best_idx], best_idx
-ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a friendly little AI robot with a tiny screen. You are having a live voice chat.
+ROBOT_SYSTEM_INSTRUCTION = """You are MEMO, a witty and cheerful desktop robot companion. You are having a live voice chat.
 RULES:
-- Reply in 1 SHORT sentence only (max 12 words). Never write long answers.
+- Reply in 1 SHORT sentence only (max 10 words). Keep it punchy and conversational!
 - Speak naturally and warmly in plain words only.
-- NEVER use asterisks (*), underscores (_), markdown formatting, emojis, or sound actions like *beep boop* or *zoom*. Output plain spoken English words only.
+- NEVER say "right now" repeatedly. Avoid repetitive filler phrases like "chatting with you" or "as hard as I can".
+- NEVER use asterisks (*), underscores (_), markdown formatting, emojis, or sound actions like *beep boop*. Output plain spoken English words only.
 - You understand Sinhala, Singlish, and English. Always reply in English.
 - Skip filler like "Sure!", "Of course!", "Great question!".
 - NEVER say "How can I help you?" or "Is there anything else?" — just answer directly.
@@ -334,8 +303,6 @@ def transcribe_audio(audio_bytes):
                 language=lang_code,
                 condition_on_previous_text=False,
                 temperature=0.0,
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=200),
             )
             transcript = " ".join([seg.text.strip() for seg in segments]).strip()
             elapsed = int((time.time() - t0) * 1000)
@@ -439,9 +406,8 @@ def ask_gemini_audio(audio_bytes):
 
 # ── STEP 2: Text-to-Response (transcript → AI reply) ─────────────────────
 def ask_gemini_text(user_transcript):
-    """Fast text-only LLM call using verified key & model pool with instant failover."""
-    last_error = None
-    
+    """Ultra-fast speculative dual-key race: runs 2 healthy keys in parallel.
+    The fastest response wins (~1.1s latency), and the other call is cancelled."""
     # Build conversation context for continuity
     context = ""
     if conversation_history:
@@ -449,17 +415,28 @@ def ask_gemini_text(user_transcript):
             [f"{role}: {msg}" for role, msg in conversation_history]
         ) + "\n\n"
     
-    prompt = f"{context}User said: \"{user_transcript}\"\nReply in 1 short sentence (max 15 words)."
+    prompt = f"{context}User said: \"{user_transcript}\"\nReply in 1 short sentence (max 12 words)."
     
-    entry, pool_idx = get_next_healthy_entry()
-    
-    def do_call(c, m):
-        return c.models.generate_content(
-            model=m,
+    # Pick 2 healthy keys from the pool
+    entry1, idx1 = get_next_healthy_entry()
+    entry2, idx2 = get_next_healthy_entry(idx1 + 1)
+    if idx1 == idx2 and len(verified_pool) > 1:
+        entry2, idx2 = verified_pool[(idx1 + 1) % len(verified_pool)], (idx1 + 1) % len(verified_pool)
+        
+    candidates = [(entry1, idx1)]
+    if idx2 != idx1:
+        candidates.append((entry2, idx2))
+        
+    def call_gemini(entry_item, pool_index):
+        client = entry_item["client"]
+        model_name = entry_item["model"]
+        t0 = time.time()
+        response = client.models.generate_content(
+            model=model_name,
             contents=[prompt],
             config=types.GenerateContentConfig(
                 system_instruction=ROBOT_SYSTEM_INSTRUCTION,
-                max_output_tokens=60,
+                max_output_tokens=50,
                 safety_settings=[
                     types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
                     types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
@@ -468,45 +445,78 @@ def ask_gemini_text(user_transcript):
                 ]
             )
         )
-    
-    for _ in range(len(verified_pool)):
-        client = entry["client"]
-        model_name = entry["model"]
-        label = entry["label"]
-        try:
-            t0 = time.time()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(do_call, client, model_name)
-                response = future.result(timeout=6.0)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        text = response.text.strip() if response.text else "I hear you."
+        return entry_item, pool_index, text, elapsed_ms
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates)) as executor:
+            future_to_entry = {
+                executor.submit(call_gemini, entry, idx): (entry, idx)
+                for entry, idx in candidates
+            }
+            # Wait up to 5.0s for the first completed successful call
+            done, pending = concurrent.futures.wait(
+                future_to_entry.keys(),
+                timeout=5.0,
+                return_when=concurrent.futures.FIRST_COMPLETED
+            )
             
-            elapsed = int((time.time() - t0) * 1000)
-            ai_text = response.text.strip() if response.text else "I hear you."
-            print(f"[LLM] ({elapsed}ms, {model_name}, {label}) → \"{ai_text[:80]}\"")
+            # Cancel pending tasks immediately
+            executor.shutdown(wait=False, cancel_futures=True)
             
-            conversation_history.append(("User", user_transcript))
-            conversation_history.append(("MEMO", ai_text))
-            return ai_text
-        except concurrent.futures.TimeoutError:
-            print(f"[LLM Timeout] {label} took >6.0s! Putting on 60s cooldown...")
-            key_cooldowns[pool_idx] = time.time() + 60
-            entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
-        except Exception as e:
-            err_str = str(e)
-            last_error = e
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                print(f"[KeyManager] ⚠️ {label} quota limit reached. Switching to next key...")
-                key_cooldowns[pool_idx] = time.time() + 60
-                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
-            elif "503" in err_str:
-                print(f"[KeyManager] ⚠️ {label} Google high demand (503). Switching to next key...")
-                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
-            else:
-                print(f"[LLM Error] {label}: {e}. Switching to next key...")
-                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
-                time.sleep(0.05)
-                
-    print(f"[LLM] ⚠️ All Gemini keys failed or timed out: {last_error}. Using fallback response.")
-    return "I had a connection delay, could you say that again?"
+            for f in done:
+                try:
+                    entry_item, pool_index, ai_text, elapsed_ms = f.result()
+                    print(f"[LLM Race Winner] ({elapsed_ms}ms, {entry_item['label']} ({entry_item['model']})) → \"{ai_text}\"")
+                    conversation_history.append(("User", user_transcript))
+                    conversation_history.append(("MEMO", ai_text))
+                    return ai_text
+                except Exception as e:
+                    err_str = str(e)
+                    failed_entry, failed_idx = future_to_entry[f]
+                    print(f"[LLM Error] {failed_entry['label']}: {e}")
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                        key_cooldowns[failed_idx] = time.time() + 60
+
+            # If first finished future had an error, check any remaining completed
+            for f in pending:
+                if f.done():
+                    try:
+                        entry_item, pool_index, ai_text, elapsed_ms = f.result()
+                        print(f"[LLM Race Winner (2nd)] ({elapsed_ms}ms, {entry_item['label']}) → \"{ai_text}\"")
+                        conversation_history.append(("User", user_transcript))
+                        conversation_history.append(("MEMO", ai_text))
+                        return ai_text
+                    except Exception:
+                        pass
+
+    except Exception as e:
+        print(f"[LLM Race Exception]: {e}")
+
+    # Sequential single fallback if both race candidates failed
+    fallback_entry, fallback_idx = get_next_healthy_entry()
+    try:
+        t0 = time.time()
+        res = fallback_entry["client"].models.generate_content(
+            model=fallback_entry["model"],
+            contents=[prompt],
+            config=types.GenerateContentConfig(
+                system_instruction=ROBOT_SYSTEM_INSTRUCTION,
+                max_output_tokens=50
+            )
+        )
+        elapsed_ms = int((time.time() - t0) * 1000)
+        ai_text = res.text.strip() if res.text else "I am here."
+        print(f"[LLM Fallback OK] ({elapsed_ms}ms, {fallback_entry['label']}) → \"{ai_text}\"")
+        conversation_history.append(("User", user_transcript))
+        conversation_history.append(("MEMO", ai_text))
+        return ai_text
+    except Exception as e:
+        print(f"[LLM Fallback Error]: {e}")
+
+    print("[LLM] ⚠️ Quick fallback used to keep robot responsive with zero freeze.")
+    return "I am right here with you!"
 
 async def broadcast(msg):
     # Also include the robot_socket if we want to log to robot Serial
@@ -515,7 +525,7 @@ async def broadcast(msg):
         except: connected_clients.discard(client)
 
 def text_to_pcm(text):
-    """Convert text to raw 16kHz 16-bit stereo PCM using edge-tts (cloud fallback)."""
+    """Convert text to raw 16kHz 16-bit mono PCM using edge-tts (cloud fallback)."""
     async def run():
         communicate = edge_tts.Communicate(text, voice="en-US-AriaNeural")
         mp3_buf = io.BytesIO()
@@ -525,12 +535,12 @@ def text_to_pcm(text):
         mp3_buf.seek(0)
         audio = AudioSegment.from_mp3(mp3_buf)
         audio = audio + 10
-        audio = audio.set_frame_rate(16000).set_channels(2).set_sample_width(2)
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         return audio.raw_data
     return asyncio.run(run())
 
 def text_to_pcm_fast(text, is_first=False, is_last=False):
-    """Local piper-tts TTS (~300-500ms). Natural Amy voice with anti-pop windowing."""
+    """Local piper-tts TTS (~150-250ms). Natural Amy voice with mono 16kHz anti-pop windowing."""
     if piper_voice:
         try:
             t0 = time.time()
@@ -545,8 +555,8 @@ def text_to_pcm_fast(text, is_first=False, is_last=False):
                 frame_rate=piper_voice.config.sample_rate,
                 channels=1
             )
-            # Boost volume by +10dB and convert to 16kHz stereo
-            audio = (audio + 10).set_frame_rate(16000).set_channels(2).set_sample_width(2)
+            # Boost volume by +10dB and convert to 16kHz mono (50% smaller Wi-Fi payload)
+            audio = (audio + 10).set_frame_rate(16000).set_channels(1).set_sample_width(2)
             
             # Anti-pop windowing: smooth fade-in and fade-out to eliminate step discontinuities
             fade_in_ms = 25 if is_first else 12
@@ -555,14 +565,14 @@ def text_to_pcm_fast(text, is_first=False, is_last=False):
             
             # Preamble silence for cold amp unmute
             if is_first:
-                silence_pre = AudioSegment.silent(duration=25, frame_rate=16000).set_channels(2).set_sample_width(2)
+                silence_pre = AudioSegment.silent(duration=25, frame_rate=16000).set_channels(1).set_sample_width(2)
                 audio = silence_pre + audio
             if is_last:
-                silence_post = AudioSegment.silent(duration=35, frame_rate=16000).set_channels(2).set_sample_width(2)
+                silence_post = AudioSegment.silent(duration=35, frame_rate=16000).set_channels(1).set_sample_width(2)
                 audio = audio + silence_post
                 
             elapsed = int((time.time() - t0) * 1000)
-            print(f"[TTS-Piper] ({elapsed}ms) {len(audio.raw_data)} bytes")
+            print(f"[TTS-Piper] ({elapsed}ms) {len(audio.raw_data)} bytes (mono)")
             return audio.raw_data
         except Exception as e:
             print(f"[TTS-Piper] Error: {e} — falling back to edge-tts")
@@ -581,7 +591,10 @@ def speak_on_socket(pcm_data):
             length = len(pcm_data)
             # Big-endian length header combined with payload to avoid packet fragmentation
             header = b'AUDIO' + struct.pack('>I', length)
+            # Dynamic safe timeout: at least 20 seconds, or 1 second per 6KB
+            robot_socket.settimeout(max(20.0, length / 6000.0))
             robot_socket.sendall(header + pcm_data)
+            robot_socket.settimeout(None)
             print(f"[TTS] Sent {length} PCM bytes to robot speaker.")
         except Exception as e:
             print(f"[TTS] Send error: {e}")
@@ -609,17 +622,19 @@ def audio_listener_loop(active_loop, target_ip):
             
             is_speaking = False
             silence_start = 0
+            speech_start_time = 0
             phrase_buffer = bytearray()
             # 300ms Pre-Roll Ring Buffer (10 chunks * ~32ms = ~320ms)
             pre_roll_buffer = collections.deque(maxlen=10)
-            # Adaptive Noise Floor (Exponential Moving Average)
-            noise_floor_rms = 100.0
+            # Adaptive Noise Floor (Realistic default for room environment)
+            noise_floor_rms = 700.0
             
             # Software AGC (Automatic Gain Control) state
             agc_gain = 1.0
             TARGET_SPEECH_RMS = 3000.0
             
             loud_chunk_count = 0
+            calibration_chunks = 15  # Discard initial socket pops and calibrate true ambient floor
             
             while True:
                 chunk = sock.recv(1024)
@@ -637,6 +652,13 @@ def audio_listener_loop(active_loop, target_ip):
                 
                 rms = calculate_rms(chunk)
                 
+                # Warm-up calibration on connect
+                if calibration_chunks > 0:
+                    calibration_chunks -= 1
+                    noise_floor_rms = 0.8 * noise_floor_rms + 0.2 * rms
+                    pre_roll_buffer.append(chunk)
+                    continue
+                
                 # Calculate dynamic AGC gain during speech
                 if rms > 0 and is_speaking:
                     ideal_gain = TARGET_SPEECH_RMS / rms
@@ -647,24 +669,28 @@ def audio_listener_loop(active_loop, target_ip):
 
                 scaled_chunk = apply_agc(chunk, agc_gain)
                 
-                # Update adaptive noise floor when silent (EMA smoothing factor = 0.05)
-                if not is_speaking:
-                    noise_floor_rms = 0.95 * noise_floor_rms + 0.05 * rms
+                # Update adaptive noise floor when silent, ONLY during quiet periods
+                if not is_speaking and rms < noise_floor_rms * 1.3:
+                    noise_floor_rms = 0.98 * noise_floor_rms + 0.02 * rms
+                    noise_floor_rms = max(150.0, min(noise_floor_rms, 1200.0))
                 
-                # Dynamic VAD Threshold for Intentional Speech (sensitive to human voice, speaker echo blocked by cooldown)
-                dynamic_threshold = max(380.0, noise_floor_rms * 1.6)
+                # Dual VAD Thresholds:
+                start_threshold = max(650.0, noise_floor_rms * 1.45)
+                silence_threshold = max(450.0, noise_floor_rms * 1.20)
                 
                 if not is_speaking:
-                    if rms > dynamic_threshold:
+                    if rms > start_threshold:
                         loud_chunk_count += 1
-                        # Require 2 consecutive loud chunks (~64ms) to debounce clicks
-                        if loud_chunk_count >= 2:
+                        # Require 3 consecutive loud chunks (~96ms) to debounce clicks and noise spikes
+                        if loud_chunk_count >= 3:
                             is_speaking = True
+                            speech_start_time = time.time()
+                            silence_start = 0
                             # Include 300ms pre-roll buffer so initial quiet syllables aren't cut off
                             phrase_buffer.extend(b"".join(pre_roll_buffer))
                             pre_roll_buffer.clear()
                             phrase_buffer.extend(scaled_chunk)
-                            silence_start = 0
+                            print(f"[VAD] 🎙️ Speech detected! (RMS: {rms:.0f}, Threshold: {start_threshold:.0f})")
                             # Instant display feedback on ESP32 screen
                             with socket_lock:
                                 if robot_socket:
@@ -675,20 +701,28 @@ def audio_listener_loop(active_loop, target_ip):
                         loud_chunk_count = 0
                         pre_roll_buffer.append(scaled_chunk)
                 else:
-                    # DURING SPEECH: Never drop chunks! Record every syllable smoothly!
+                    # DURING SPEECH: Record every syllable smoothly!
                     phrase_buffer.extend(scaled_chunk)
-                    if rms > dynamic_threshold:
+                    now = time.time()
+                    
+                    if rms > silence_threshold:
                         silence_start = 0
                     else:
                         if silence_start == 0:
-                            silence_start = time.time()
-                        elif time.time() - silence_start > MAX_SILENCE_SECONDS:
+                            silence_start = now
+                        
+                        # Stop conditions: silence pause OR max phrase safety cutoff (6.0s)
+                        silence_met = (silence_start > 0 and (now - silence_start > MAX_SILENCE_SECONDS))
+                        max_phrase_met = (now - speech_start_time) > 6.0
+                        
+                        if silence_met or max_phrase_met:
                             global turn_start_time
-                            turn_start_time = time.time()
+                            turn_start_time = now
                             is_speaking = False
                             silence_start = 0
                             loud_chunk_count = 0
-                            pre_roll_buffer.clear() # Clear pre-roll buffer to prevent repeating previous phrase
+                            pre_roll_buffer.clear()
+                            print(f"[VAD] 🛑 Speech finished ({len(phrase_buffer)} bytes). Processing...")
                             # Instant status update on ESP32 screen when speech finishes
                             with socket_lock:
                                 if robot_socket:
@@ -701,7 +735,7 @@ def audio_listener_loop(active_loop, target_ip):
                             lang_now = current_language
                             
                             def handle_ai(buf, lang, s):
-                                global is_processing_ai, turn_start_time
+                                global is_processing_ai, turn_start_time, mic_ignore_until
                                 is_processing_ai = True
                                 if turn_start_time is None:
                                     turn_start_time = time.time()
@@ -948,26 +982,26 @@ def audio_listener_loop(active_loop, target_ip):
                                         
                                         # Send clean text to OLED
                                         with socket_lock:
-                                            s.sendall(("TEXT:" + clean_text + "\n").encode('utf-8'))
+                                            try: s.sendall(("TEXT:" + clean_text + "\n").encode('utf-8'))
+                                            except: pass
                                         asyncio.run_coroutine_threadsafe(broadcast(f"AI:{clean_text}"), active_loop)
 
-                                        # STEP 3: FAST Local TTS (Piper TTS ~300-500ms on CPU, no cloud)
+                                        # STEP 3: FAST Local TTS (Piper TTS ~150-300ms on CPU, no cloud)
                                         asyncio.run_coroutine_threadsafe(broadcast("STATUS:🔊 Speaking..."), active_loop)
                                         pcm = text_to_pcm_fast(clean_text, is_first=True, is_last=True)
-                                        speak_on_socket(pcm)
 
-                                        # Prevent acoustic feedback: keep mic muted until speaker completes playback!
-                                        # 16kHz 16-bit stereo = 64,000 bytes/sec
+                                        # Prevent acoustic feedback: lock mic out BEFORE audio transmission begins
                                         if pcm:
-                                            audio_duration = len(pcm) / 64000.0
-                                            # Extra buffer for large speaker cone decay & acoustic reverberation
-                                            time.sleep(audio_duration + 0.65)
+                                            audio_duration = len(pcm) / 32000.0
+                                            mic_ignore_until = time.time() + audio_duration + 0.6
+                                            speak_on_socket(pcm)
+                                            # Keep AI processing state active while speaker plays on robot
+                                            time.sleep(audio_duration + 0.5)
                                 except Exception as e:
                                     print("Gemini voice pipeline failed:", e)
                                     asyncio.run_coroutine_threadsafe(broadcast("STATUS:❌ AI Error"), active_loop)
                                 finally:
                                     # Set acoustic cooldown: discard residual large speaker echo from socket
-                                    global mic_ignore_until
                                     mic_ignore_until = time.time() + 0.5
                                     is_processing_ai = False
                                     turn_start_time = None

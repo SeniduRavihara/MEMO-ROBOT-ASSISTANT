@@ -484,7 +484,7 @@ void loop() {
                              ((uint32_t)len_buf[1] << 16) |
                              ((uint32_t)len_buf[2] << 8)  |
                               (uint32_t)len_buf[3];
-        Serial.printf("[AUDIO] Receiving %u bytes into PSRAM...\n", audio_len);
+        Serial.printf("[AUDIO] Ingesting %u bytes mono PCM...\n", audio_len);
 
         isSpeaking = true;
         eyes.setEmotion(EMOTION_SPEAKING);
@@ -493,56 +493,95 @@ void loop() {
 
         if (use_psram) {
           uint32_t total_received = 0;
+          uint32_t play_offset = 0;
           uint8_t* play_buf = audio_psram_buf;
           unsigned long start_recv = millis();
+          bool playback_started = false;
+          const uint32_t PREBUFFER_BYTES = 6144; // ~192ms of 16kHz mono (instant start!)
 
-          // High-speed ingest directly into PSRAM (no I2C screen blocking during download)
-          while (total_received < audio_len && client.connected()) {
-            int avail = client.available();
-            if (avail > 0) {
-              int to_read = min((uint32_t)avail, audio_len - total_received);
-              int got = client.read(play_buf + total_received, to_read);
-              if (got > 0) {
-                total_received += got;
-                start_recv = millis();
+          while ((play_offset < audio_len) && (client.connected() || total_received > play_offset)) {
+            // 1. Ingest newly arrived TCP bytes directly into PSRAM
+            if (total_received < audio_len && client.connected()) {
+              int avail = client.available();
+              if (avail > 0) {
+                int to_read = min((uint32_t)avail, audio_len - total_received);
+                int got = client.read(play_buf + total_received, to_read);
+                if (got > 0) {
+                  total_received += got;
+                  start_recv = millis();
+                }
               }
-            } else {
+            }
+
+            // 2. Start playback as soon as pre-buffer threshold is reached
+            if (!playback_started) {
+              if (total_received >= PREBUFFER_BYTES || total_received >= audio_len) {
+                playback_started = true;
+                Serial.printf("[AUDIO] ⚡ Pre-buffer ready (%u bytes). Starting speaker NOW!\n", total_received);
+              } else {
+                delay(1);
+                if (millis() - start_recv > 6000) {
+                  Serial.println("[AUDIO] ⚠️ Timeout waiting for pre-buffer!");
+                  break;
+                }
+                continue;
+              }
+            }
+
+            // 3. Play available chunks and expand Mono -> Stereo on the fly
+            uint32_t unplayed = total_received - play_offset;
+            if (unplayed >= 1024 || (total_received >= audio_len && unplayed > 0)) {
+              size_t mono_chunk = min((uint32_t)1024, unplayed);
+              mono_chunk = (mono_chunk / 2) * 2; // ensure 16-bit sample alignment
+              if (mono_chunk > 0) {
+                // Expand Mono -> Stereo into stack buffer for MAX98357A I2S DAC
+                int16_t stereo_buf[1024]; // 2048 bytes (512 L + 512 R samples)
+                int16_t* mono_samples = (int16_t*)(play_buf + play_offset);
+                int samples = mono_chunk / 2;
+                for (int i = 0; i < samples; i++) {
+                  stereo_buf[i * 2]     = mono_samples[i];
+                  stereo_buf[i * 2 + 1] = mono_samples[i];
+                }
+                size_t written = 0;
+                i2s_write(I2S_SPK_PORT, stereo_buf, samples * 4, &written, portMAX_DELAY);
+                play_offset += mono_chunk;
+              }
+              renderEyes();
+            } else if (total_received < audio_len) {
               delay(1);
-              if (millis() - start_recv > 3000) {
+              if (millis() - start_recv > 6000) {
                 Serial.println("[AUDIO] ⚠️ Timeout waiting for audio stream!");
                 break;
               }
+            } else {
+              break;
             }
           }
 
-          Serial.printf("[AUDIO] Downloaded %u / %u bytes into PSRAM. Playing...\n", total_received, audio_len);
-
-          // Play in 2048-byte chunks (32ms of 16kHz stereo) so eyes bounce during speech!
-          uint32_t offset = 0;
-          while (offset < total_received) {
-            size_t chunk = min((uint32_t)2048, total_received - offset);
-            size_t written = 0;
-            i2s_write(I2S_SPK_PORT, play_buf + offset, chunk, &written, portMAX_DELAY);
-            offset += written;
-            renderEyes();
-          }
-          Serial.printf("[AUDIO] Playback finished: %u bytes\n", offset);
+          Serial.printf("[AUDIO] Finished playing %u / %u bytes.\n", play_offset, audio_len);
 
         } else {
-          // Direct streaming fallback
+          // Direct fallback streaming
           uint32_t total_received = 0;
-          uint8_t stream_buf[2048];
+          uint8_t mono_buf[1024];
           while (total_received < audio_len && client.connected()) {
             int avail = client.available();
             if (avail > 0) {
               int to_read = min((uint32_t)avail, audio_len - total_received);
-              to_read = min((uint32_t)2048, (uint32_t)to_read);
-              to_read = (to_read / 4) * 4;
+              to_read = min((uint32_t)1024, (uint32_t)to_read);
+              to_read = (to_read / 2) * 2;
               if (to_read == 0) { delay(1); continue; }
-              int got = client.readBytes(stream_buf, to_read);
+              int got = client.readBytes((char*)mono_buf, to_read);
               if (got > 0) {
+                int16_t stereo_buf[1024];
+                int16_t* mono_samples = (int16_t*)mono_buf;
+                int samples = got / 2;
+                for (int i = 0; i < samples; i++) {
+                  stereo_buf[i * 2]     = mono_samples[i];
+                  stereo_buf[i * 2 + 1] = mono_samples[i];
+                }
                 size_t wr = 0;
-                i2s_write(I2S_SPK_PORT, stream_buf, got, &wr, portMAX_DELAY);
+                i2s_write(I2S_SPK_PORT, stereo_buf, samples * 4, &wr, portMAX_DELAY);
                 total_received += got;
               }
             } else delay(1);
