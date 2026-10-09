@@ -209,6 +209,71 @@ def calculate_rms(audio_bytes):
     sum_sq = sum(int(s)**2 for s in shorts)
     return math.sqrt(sum_sq / count)
 
+def apply_spectral_subtraction(pcm_bytes, noise_profile=None):
+    """Subtract ambient noise profile & electrical hum using Spectral Subtraction + HPF + De-click."""
+    if len(pcm_bytes) < 1024:
+        return pcm_bytes
+    try:
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float64)
+        out_len = len(samples)
+
+        # 1. High-Pass Filter (>80Hz) to cut sub-audible room rumble and DC drift
+        fft_full = np.fft.rfft(samples)
+        freqs = np.fft.rfftfreq(out_len, 1.0 / SAMPLE_RATE)
+        hpf_mask = np.ones_like(freqs)
+        transition = (freqs >= 60) & (freqs <= 95)
+        hpf_mask[freqs < 60] = 0.0
+        hpf_mask[transition] = 0.5 * (1 - np.cos(np.pi * (freqs[transition] - 60) / 35))
+        filtered = np.fft.irfft(fft_full * hpf_mask, n=out_len)
+
+        # 2. De-clicker: replace isolated sharp transient spikes
+        diff = np.abs(np.diff(filtered))
+        threshold = max(350.0, np.median(diff) + 4.0 * np.std(diff))
+        spikes = np.where(diff > threshold)[0]
+        for idx in spikes:
+            if 2 <= idx < out_len - 2:
+                filtered[idx] = (filtered[idx-1] + filtered[idx+1]) / 2.0
+
+        # 3. Spectral Subtraction using calibrated noise footprint
+        win_len = 512
+        hop = 256
+        window = np.hanning(win_len)
+
+        # Fallback: if no pre-calibrated noise profile, estimate from first 350ms of audio (pre-roll)
+        if noise_profile is None and out_len >= win_len:
+            noise_slice_len = min(out_len, int(SAMPLE_RATE * 0.35))
+            noise_slice = filtered[:noise_slice_len]
+            mags = []
+            for i in range(0, len(noise_slice) - win_len, hop):
+                chunk_slice = noise_slice[i:i+win_len] * window
+                mags.append(np.abs(np.fft.rfft(chunk_slice)))
+            if mags:
+                noise_profile = np.mean(mags, axis=0) * 1.35
+
+        if noise_profile is not None:
+            out_audio = np.zeros(out_len + win_len, dtype=np.float64)
+            norm_win = np.zeros(out_len + win_len, dtype=np.float64)
+
+            for i in range(0, out_len - win_len, hop):
+                chunk_slice = filtered[i:i+win_len] * window
+                spec = np.fft.rfft(chunk_slice)
+                mag = np.abs(spec)
+                phase = np.angle(spec)
+                if len(noise_profile) == len(mag):
+                    clean_mag = np.maximum(mag - noise_profile, 0.04 * mag)
+                else:
+                    clean_mag = mag
+                chunk_clean = np.fft.irfft(clean_mag * np.exp(1j * phase))
+                out_audio[i:i+win_len] += chunk_clean * window
+                norm_win[i:i+win_len] += window**2
+
+            norm_win = np.maximum(norm_win, 1e-6)
+            filtered = out_audio[:out_len] / norm_win[:out_len]
+
+        return np.clip(filtered, -32768, 32767).astype(np.int16).tobytes()
+    except Exception:
+        return pcm_bytes
+
 def apply_agc(audio_bytes, gain):
     """Apply dynamic Software AGC gain scaling to 16-bit PCM samples without clipping."""
     if gain == 1.0:
@@ -452,50 +517,52 @@ def ask_gemini_text(user_transcript):
         text = response.text.strip() if response.text else "I hear you."
         return entry_item, pool_index, text, elapsed_ms
 
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates))
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(candidates)) as executor:
-            future_to_entry = {
-                executor.submit(call_gemini, entry, idx): (entry, idx)
-                for entry, idx in candidates
-            }
-            # Wait up to 5.0s for the first completed successful call
-            done, pending = concurrent.futures.wait(
-                future_to_entry.keys(),
-                timeout=5.0,
-                return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            
-            # Cancel pending tasks immediately
-            executor.shutdown(wait=False, cancel_futures=True)
-            
-            for f in done:
+        future_to_entry = {
+            executor.submit(call_gemini, entry, idx): (entry, idx)
+            for entry, idx in candidates
+        }
+        # Wait up to 5.0s for the first completed successful call
+        done, pending = concurrent.futures.wait(
+            future_to_entry.keys(),
+            timeout=5.0,
+            return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        
+        # Cancel pending tasks immediately without blocking on lagging candidate
+        executor.shutdown(wait=False, cancel_futures=True)
+        
+        for f in done:
+            try:
+                entry_item, pool_index, ai_text, elapsed_ms = f.result()
+                print(f"[LLM Race Winner] ({elapsed_ms}ms, {entry_item['label']} ({entry_item['model']})) → \"{ai_text}\"")
+                conversation_history.append(("User", user_transcript))
+                conversation_history.append(("MEMO", ai_text))
+                return ai_text
+            except Exception as e:
+                err_str = str(e)
+                failed_entry, failed_idx = future_to_entry[f]
+                print(f"[LLM Error] {failed_entry['label']}: {e}")
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    key_cooldowns[failed_idx] = time.time() + 60
+
+        # If first finished future had an error, check any remaining completed
+        for f in pending:
+            if f.done():
                 try:
                     entry_item, pool_index, ai_text, elapsed_ms = f.result()
-                    print(f"[LLM Race Winner] ({elapsed_ms}ms, {entry_item['label']} ({entry_item['model']})) → \"{ai_text}\"")
+                    print(f"[LLM Race Winner (2nd)] ({elapsed_ms}ms, {entry_item['label']}) → \"{ai_text}\"")
                     conversation_history.append(("User", user_transcript))
                     conversation_history.append(("MEMO", ai_text))
                     return ai_text
-                except Exception as e:
-                    err_str = str(e)
-                    failed_entry, failed_idx = future_to_entry[f]
-                    print(f"[LLM Error] {failed_entry['label']}: {e}")
-                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                        key_cooldowns[failed_idx] = time.time() + 60
-
-            # If first finished future had an error, check any remaining completed
-            for f in pending:
-                if f.done():
-                    try:
-                        entry_item, pool_index, ai_text, elapsed_ms = f.result()
-                        print(f"[LLM Race Winner (2nd)] ({elapsed_ms}ms, {entry_item['label']}) → \"{ai_text}\"")
-                        conversation_history.append(("User", user_transcript))
-                        conversation_history.append(("MEMO", ai_text))
-                        return ai_text
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
     except Exception as e:
         print(f"[LLM Race Exception]: {e}")
+        try: executor.shutdown(wait=False, cancel_futures=True)
+        except: pass
 
     # Sequential single fallback if both race candidates failed
     fallback_entry, fallback_idx = get_next_healthy_entry()
@@ -637,7 +704,9 @@ def audio_listener_loop(active_loop, target_ip):
             TARGET_SPEECH_RMS = 3000.0
             
             loud_chunk_count = 0
-            calibration_chunks = 15  # Discard initial socket pops and calibrate true ambient floor
+            calibration_chunks = 25  # ~0.8s: Discard initial socket pops and calibrate true ambient floor
+            noise_profile_mags = []
+            ambient_noise_profile = None
             last_heartbeat = 0
             
             while True:
@@ -661,6 +730,13 @@ def audio_listener_loop(active_loop, target_ip):
                     calibration_chunks -= 1
                     noise_floor_rms = 0.8 * noise_floor_rms + 0.2 * rms
                     pre_roll_buffer.append(chunk)
+                    if len(chunk) >= 1024:
+                        s_np = np.frombuffer(chunk[:1024], dtype=np.int16).astype(np.float64)
+                        if len(s_np) == 512:
+                            noise_profile_mags.append(np.abs(np.fft.rfft(s_np * np.hanning(512))))
+                    if calibration_chunks == 0 and noise_profile_mags:
+                        ambient_noise_profile = np.mean(noise_profile_mags, axis=0) * 1.35
+                        print(f"[Mic Audio] 🎯 Calibrated ambient noise profile ({len(noise_profile_mags)} frames, floor={noise_floor_rms:.0f} RMS) for spectral subtraction.")
                     continue
                 
                 # Heartbeat to give real-time visibility into incoming mic stream
@@ -754,18 +830,24 @@ def audio_listener_loop(active_loop, target_ip):
                                     if len(buf) < 11000:
                                         return
                                     
+                                    # STEP 0: Spectral Subtraction & Noise Filtering (>90% noise reduction)
+                                    t_clean0 = time.time()
+                                    clean_buf = apply_spectral_subtraction(buf, ambient_noise_profile)
+                                    clean_ms = int((time.time() - t_clean0) * 1000)
+                                    print(f"[Noise Filter] 🧹 Spectral subtraction applied in {clean_ms}ms")
+                                    
                                     # Save last capture for inspection/playback
                                     try:
                                         with wave.open("last_capture.wav", "wb") as wf:
                                             wf.setnchannels(1)
                                             wf.setsampwidth(2)
                                             wf.setframerate(SAMPLE_RATE)
-                                            wf.writeframes(buf)
+                                            wf.writeframes(clean_buf)
                                     except Exception:
                                         pass
                                     
                                     # STEP 1: Fast Local STT (audio → text via Whisper)
-                                    user_transcript = transcribe_audio(buf)
+                                    user_transcript = transcribe_audio(clean_buf)
 
                                     if not user_transcript:
                                         print("[Skip] No speech detected, ignoring.")

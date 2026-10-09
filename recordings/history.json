@@ -1,0 +1,26 @@
+[
+  {
+    "label": "old_mic",
+    "timestamp": "previous",
+    "duration": 30.0,
+    "peak": 1784,
+    "speech_rms": 108.9,
+    "noise_floor": 54.9,
+    "snr_db": 6.0,
+    "click_spikes": 226,
+    "transcript": "hello everyone, can you hear me right now?"
+  },
+  {
+    "label": "new_mic",
+    "timestamp": "20261009_210611",
+    "duration": 10.0,
+    "peak": 32767,
+    "speech_rms": 7306.4,
+    "raw_noise": 5450.2,
+    "noise_floor": 1266.3,
+    "noise_reduction": "-76.8%",
+    "snr_db": 15.2,
+    "click_spikes": 3681,
+    "transcript": "(no speech detected)"
+  }
+]
