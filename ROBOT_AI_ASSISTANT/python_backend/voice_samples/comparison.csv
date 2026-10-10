@@ -1,0 +1,6 @@
+Sample_ID,Timestamp,Audio_File,Duration_Sec,RMS,Whisper_STT,Whisper_ms,Gemini_Heard,Gemini_Reply,Gemini_ms
+1,"2026-09-27 22:52:44","1.wav",11.02,461,"the quick down for down over a little.",542,"","",0
+2,"2026-09-27 22:53:00","2.wav",8.06,446,"What I do here about?",504,"","",0
+3,"2026-09-27 22:53:17","3.wav",16.06,580,"Are you sure can you hear me clearly?",443,"","",0
+4,"2026-09-27 22:53:29","4.wav",3.22,803,"I am a family, too many girls away from you.",471,"","",0
+5,"2026-09-27 22:53:46","5.wav",12.66,656,"I am attending 2 meters away from you.",519,"","",0
