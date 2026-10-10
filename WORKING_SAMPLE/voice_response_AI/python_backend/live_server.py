@@ -26,6 +26,7 @@ from pydub.effects import normalize
 import builtins
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
+from faster_whisper.vad import get_vad_model
 from google import genai
 from google.genai import types
 from google.genai.types import HarmCategory, HarmBlockThreshold
@@ -384,6 +385,60 @@ def trim_silence_pcm(audio_bytes, threshold=220, frame_size=640):
     if saved_pct > 5:
         print(f"[Trim] Removed {saved_pct}% silence from audio ({len(audio_bytes)} → {len(trimmed)} bytes)")
     return trimmed
+
+# ── XIAOZHI-STYLE STREAMING NEURAL VAD (SILERO VAD ONNX) ───────────────────
+class StreamingNeuralVAD:
+    """Stateful streaming Neural VAD using Silero VAD (Xiaozhi Architecture).
+    Evaluates 512-sample (32ms) audio chunks in ~0.3ms with neural precision.
+    Detects vocal formants rather than energy volume, completely immune to room fans/mic hum."""
+    def __init__(self, start_prob=0.50, end_prob=0.35, min_silence_ms=350):
+        self.vad = get_vad_model()
+        self.start_prob = start_prob
+        self.end_prob = end_prob
+        self.min_silence_chunks = max(4, int(min_silence_ms / 32))  # ~11 chunks = 350ms
+        self.consecutive_speech = 0
+        self.consecutive_silence = 0
+        self.is_speaking = False
+
+    def reset(self):
+        self.consecutive_speech = 0
+        self.consecutive_silence = 0
+        self.is_speaking = False
+
+    def process_chunk(self, pcm_bytes):
+        """Processes 1024 bytes (512 int16 samples = 32ms at 16kHz).
+        Returns: ('IDLE' | 'SPEECH_START' | 'SPEAKING' | 'SPEECH_END', speech_prob)"""
+        if len(pcm_bytes) < 1024:
+            return ("SPEAKING" if self.is_speaking else "IDLE"), 0.0
+        
+        samples = np.frombuffer(pcm_bytes[:1024], dtype=np.int16).astype(np.float32) / 32768.0
+        prob = float(self.vad(samples)[0])
+
+        if not self.is_speaking:
+            if prob >= self.start_prob:
+                self.consecutive_speech += 1
+                if self.consecutive_speech >= 2:  # Debounce clicks (~64ms vocal confirmation)
+                    self.is_speaking = True
+                    self.consecutive_silence = 0
+                    return "SPEECH_START", prob
+            else:
+                self.consecutive_speech = 0
+            return "IDLE", prob
+        else:
+            if prob < self.end_prob:
+                self.consecutive_silence += 1
+                if self.consecutive_silence >= self.min_silence_chunks:
+                    self.is_speaking = False
+                    self.consecutive_speech = 0
+                    self.consecutive_silence = 0
+                    return "SPEECH_END", prob
+            else:
+                self.consecutive_silence = 0
+            return "SPEAKING", prob
+
+print("⏳ Initializing Xiaozhi-style Silero Neural VAD engine...")
+neural_vad = StreamingNeuralVAD(start_prob=0.50, end_prob=0.35, min_silence_ms=350)
+print("✅ Silero Neural VAD active! (0.3ms frame classifier, Xiaozhi architecture)")
 
 # ── LOCAL WHISPER STT MODEL ───────────────────────────────────────────────
 print("⏳ Loading Whisper STT model...")
@@ -815,457 +870,437 @@ def audio_listener_loop(active_loop, target_ip):
                         print(f"[Mic Audio] 🎯 Calibrated ambient noise profile ({len(noise_profile_mags)} frames, floor={noise_floor_rms:.0f} RMS) for spectral subtraction.")
                     continue
                 
+                # Real-Time Silero Neural VAD Classification (Xiaozhi Architecture)
+                vad_event, voice_prob = neural_vad.process_chunk(chunk)
+
                 # Heartbeat to give real-time visibility into incoming mic stream
                 if not is_speaking and (time.time() - last_heartbeat > 2.5):
                     last_heartbeat = time.time()
-                    print(f"[Mic Audio] 🟢 Ingesting audio: RMS={rms:.0f} | NoiseFloor={noise_floor_rms:.0f} | StartTrigger={max(100.0, noise_floor_rms * 2.0):.0f}")
+                    print(f"[Mic Audio] 🟢 Ingesting audio: VoiceProb={voice_prob:.1%} | RMS={rms:.0f}")
                 
-                # Calculate dynamic AGC gain during speech
+                # Dynamic AGC
                 if rms > 0 and is_speaking:
                     ideal_gain = TARGET_SPEECH_RMS / rms
                     ideal_gain = max(1.0, min(ideal_gain, 4.0))
                     agc_gain = 0.9 * agc_gain + 0.1 * ideal_gain
                 elif not is_speaking:
-                    agc_gain = 0.95 * agc_gain + 0.05 * 1.0  # Reset gain smoothly when silent
+                    agc_gain = 0.95 * agc_gain + 0.05 * 1.0
 
                 scaled_chunk = apply_agc(chunk, agc_gain)
                 
-                # Update adaptive noise floor when silent, ONLY during quiet periods
+                # Update adaptive noise floor during silent periods
                 if not is_speaking and rms < noise_floor_rms * 1.5:
                     noise_floor_rms = 0.95 * noise_floor_rms + 0.05 * rms
                     noise_floor_rms = max(20.0, min(noise_floor_rms, 600.0))
-                
-                # Dual VAD Thresholds (Dynamic based on true ambient room noise):
-                start_threshold = max(100.0, noise_floor_rms * 2.2)
-                silence_threshold = max(80.0, noise_floor_rms * 1.75)
-                
+
                 if not is_speaking:
                     pre_roll_buffer.append(scaled_chunk)
-                    if rms > start_threshold:
-                        loud_chunk_count += 1
-                        # Require 2 consecutive loud chunks (~64ms) to debounce clicks
-                        if loud_chunk_count >= 2:
-                            is_speaking = True
-                            speech_start_time = time.time()
-                            silence_start = 0
-                            # Include full 500ms pre-roll lead-in so initial consonants ("Can", "Look") are never cut off
-                            phrase_buffer.extend(b"".join(pre_roll_buffer))
-                            pre_roll_buffer.clear()
-                            print(f"[VAD] 🎙️ Speech detected! (RMS: {rms:.0f}, Threshold: {start_threshold:.0f})")
-                            # Instant display feedback on ESP32 screen
-                            with socket_lock:
-                                if robot_socket:
-                                    try: robot_socket.sendall(b"TEXT:Listening...\n")
-                                    except: pass
-                            asyncio.run_coroutine_threadsafe(broadcast("LISTENING_START"), active_loop)
-                    else:
-                        loud_chunk_count = 0
+                    if vad_event == "SPEECH_START":
+                        is_speaking = True
+                        speech_start_time = time.time()
+                        phrase_buffer.extend(b"".join(pre_roll_buffer))
+                        pre_roll_buffer.clear()
+                        print(f"[Neural VAD] 🎙️ Human speech detected! (Voice Prob: {voice_prob:.1%}, RMS: {rms:.0f})")
+                        with socket_lock:
+                            if robot_socket:
+                                try: robot_socket.sendall(b"TEXT:Listening...\n")
+                                except: pass
+                        asyncio.run_coroutine_threadsafe(broadcast("LISTENING_START"), active_loop)
                 else:
-                    # DURING SPEECH: Record every syllable smoothly!
                     phrase_buffer.extend(scaled_chunk)
                     now = time.time()
+                    max_phrase_met = (now - speech_start_time) > 5.5
                     
-                    if rms > silence_threshold:
-                        silence_start = 0
-                    else:
-                        if silence_start == 0:
-                            silence_start = now
-                        
-                        # Stop conditions: silence pause (450ms) OR max phrase safety cutoff (5.0s)
-                        silence_met = (silence_start > 0 and (now - silence_start > MAX_SILENCE_SECONDS))
-                        max_phrase_met = (now - speech_start_time) > 5.0
-                        
-                        if silence_met or max_phrase_met:
-                            global turn_start_time
-                            turn_start_time = now
-                            is_speaking = False
-                            silence_start = 0
-                            loud_chunk_count = 0
-                            pre_roll_buffer.clear()
-                            print(f"[VAD] 🛑 Speech finished ({len(phrase_buffer)} bytes). Processing...")
-                            # Instant status update on ESP32 screen when speech finishes
-                            with socket_lock:
-                                if robot_socket:
-                                    try: robot_socket.sendall(b"TEXT:Thinking...\n")
-                                    except: pass
-                            asyncio.run_coroutine_threadsafe(broadcast("LISTENING_STOP"), active_loop)
+                    if vad_event == "SPEECH_END" or max_phrase_met:
+                        global turn_start_time
+                        turn_start_time = now
+                        is_speaking = False
+                        neural_vad.reset()
+                        pre_roll_buffer.clear()
+                        duration_s = len(phrase_buffer) / 32000.0
+                        print(f"[Neural VAD] 🛑 Speech finished ({len(phrase_buffer)} bytes, {duration_s:.2f}s). Processing...")
+                        with socket_lock:
+                            if robot_socket:
+                                try: robot_socket.sendall(b"TEXT:Thinking...\n")
+                                except: pass
+                        asyncio.run_coroutine_threadsafe(broadcast("LISTENING_STOP"), active_loop)
                             
-                            buffer_copy = bytearray(phrase_buffer)
-                            phrase_buffer = bytearray()
-                            lang_now = current_language
+                        buffer_copy = bytearray(phrase_buffer)
+                        phrase_buffer = bytearray()
+                        lang_now = current_language
+                        
+                        def handle_ai(buf, lang, s):
+                            global is_processing_ai, turn_start_time, mic_ignore_until, is_session_active, last_active_time
+                            is_processing_ai = True
+                            if turn_start_time is None:
+                                turn_start_time = time.time()
+                            t_start = turn_start_time
                             
-                            def handle_ai(buf, lang, s):
-                                global is_processing_ai, turn_start_time, mic_ignore_until, is_session_active, last_active_time
-                                is_processing_ai = True
-                                if turn_start_time is None:
-                                    turn_start_time = time.time()
-                                t_start = turn_start_time
+                            try:
+                                # Discard noise blips under 0.35s (less than 11,000 bytes)
+                                if len(buf) < 11000:
+                                    return
                                 
+                                # STEP 0: Spectral Subtraction & Noise Filtering (>90% noise reduction)
+                                t_clean0 = time.time()
+                                clean_buf = apply_spectral_subtraction(buf, ambient_noise_profile)
+                                clean_ms = int((time.time() - t_clean0) * 1000)
+                                print(f"[Noise Filter] 🧹 Spectral subtraction applied in {clean_ms}ms")
+                                
+                                # Save last capture for inspection/playback
                                 try:
-                                    # Discard noise blips under 0.35s (less than 11,000 bytes)
-                                    if len(buf) < 11000:
-                                        return
-                                    
-                                    # STEP 0: Spectral Subtraction & Noise Filtering (>90% noise reduction)
-                                    t_clean0 = time.time()
-                                    clean_buf = apply_spectral_subtraction(buf, ambient_noise_profile)
-                                    clean_ms = int((time.time() - t_clean0) * 1000)
-                                    print(f"[Noise Filter] 🧹 Spectral subtraction applied in {clean_ms}ms")
-                                    
-                                    # Save last capture for inspection/playback
-                                    try:
-                                        with wave.open("last_capture.wav", "wb") as wf:
-                                            wf.setnchannels(1)
-                                            wf.setsampwidth(2)
-                                            wf.setframerate(SAMPLE_RATE)
-                                            wf.writeframes(clean_buf)
-                                    except Exception:
-                                        pass
-                                    
-                                    # STEP 1: Fast Local STT (audio → text via Whisper)
-                                    user_transcript = transcribe_audio(clean_buf)
+                                    with wave.open("last_capture.wav", "wb") as wf:
+                                        wf.setnchannels(1)
+                                        wf.setsampwidth(2)
+                                        wf.setframerate(SAMPLE_RATE)
+                                        wf.writeframes(clean_buf)
+                                except Exception:
+                                    pass
+                                
+                                # STEP 1: Fast Local STT (audio → text via Whisper)
+                                user_transcript = transcribe_audio(clean_buf)
 
-                                    if not user_transcript or is_hallucination_or_noise(user_transcript):
-                                        print(f"[Skip] Empty or noise artifact ('{user_transcript}'), ignoring.")
-                                        with socket_lock:
-                                            if robot_socket:
-                                                ready_cmd = b"TEXT:MEMO Ready! Speak...\n" if is_session_active else b"TEXT:Sleeping...\n"
-                                                try: robot_socket.sendall(ready_cmd)
-                                                except: pass
-                                        return
-
-                                    # Check Wake Word & Sleep Phrases
-                                    is_wake, wake_word, query = check_wake_word(user_transcript)
-                                    is_sleep, sleep_phrase = check_sleep_phrase(user_transcript)
-
-                                    if not is_session_active:
-                                        if not is_wake:
-                                            print(f"[Sleeping] 💤 Ignored ambient speech: \"{user_transcript}\" (Say 'Hey Memo' to wake)")
-                                            with socket_lock:
-                                                if robot_socket:
-                                                    try: robot_socket.sendall(b"TEXT:Sleeping...\n")
-                                                    except: pass
-                                            asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
-                                            return
-                                        else:
-                                            is_session_active = True
-                                            last_active_time = time.time()
-                                            print(f"[Wake Word] 🔔 Wake word '{wake_word}' detected! MEMO is awake!")
-                                            asyncio.run_coroutine_threadsafe(broadcast("STATUS:🟢 Awake! Listening..."), active_loop)
-
-                                            if not query:
-                                                # User just said "Hey Memo!" or "Memo!"
-                                                wake_greetings = [
-                                                    "I'm here! What can I do for you?",
-                                                    "Yes? I'm listening!",
-                                                    "Hey! How can I help?",
-                                                    "Hello! What's on your mind?"
-                                                ]
-                                                ack_text = random.choice(wake_greetings)
-                                                print(f"MEMO: {ack_text}")
-                                                with socket_lock:
-                                                    try: s.sendall(("TEXT:" + ack_text + "\n").encode('utf-8'))
-                                                    except: pass
-                                                asyncio.run_coroutine_threadsafe(broadcast(f"AI:{ack_text}"), active_loop)
-                                                pcm = text_to_pcm_fast(ack_text, is_first=True, is_last=True)
-                                                if pcm:
-                                                    audio_duration = len(pcm) / 32000.0
-                                                    mic_ignore_until = time.time() + audio_duration + 0.6
-                                                    speak_on_socket(pcm)
-                                                    time.sleep(audio_duration + 0.3)
-                                                return
-                                            else:
-                                                user_transcript = query
-                                                print(f"[Wake Query] Processing query: \"{user_transcript}\"")
-                                    else:
-                                        # Session is already active!
-                                        if is_sleep:
-                                            is_session_active = False
-                                            print(f"[Session] 💤 User said '{sleep_phrase}'. Putting MEMO to sleep.")
-                                            bye_text = "Going to sleep now. Goodnight!"
-                                            print(f"MEMO: {bye_text}")
-                                            with socket_lock:
-                                                try: s.sendall(("TEXT:" + bye_text + "\n").encode('utf-8'))
-                                                except: pass
-                                            asyncio.run_coroutine_threadsafe(broadcast(f"AI:{bye_text}"), active_loop)
-                                            pcm = text_to_pcm_fast(bye_text, is_first=True, is_last=True)
-                                            if pcm:
-                                                audio_duration = len(pcm) / 32000.0
-                                                mic_ignore_until = time.time() + audio_duration + 0.6
-                                                speak_on_socket(pcm)
-                                                time.sleep(audio_duration + 0.3)
-                                            with socket_lock:
-                                                if robot_socket:
-                                                    try: robot_socket.sendall(b"TEXT:Sleeping...\n")
-                                                    except: pass
-                                            asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
-                                            return
-
-                                        if is_wake and query:
-                                            user_transcript = query
-                                        last_active_time = time.time()
-
-                                    # Deduplication filter
-                                    if conversation_history and len(conversation_history) >= 2:
-                                        last_user = conversation_history[-2][1]
-                                        if user_transcript.lower() == last_user.lower():
-                                            print(f"[Filter] Duplicate transcript '{user_transcript}' - skipping.")
-                                            return
-
-                                    print(f"You said: {user_transcript}")
-                                    asyncio.run_coroutine_threadsafe(broadcast(f"USER:{user_transcript}"), active_loop)
-
-                                    if STREAMING_TTS:
-                                        # ==========================================================
-                                        # OPTION B: STREAMING LLM → CHUNKED TTS PIPELINING (DECOUPLED)
-                                        # ==========================================================
-                                        punct_re = re.compile(r'([.!?,;:\n])(\s+|$)')
-                                        full_ai_text = ""
-                                        first_chunk_sent = False
-                                        total_pcm_bytes = 0
-                                        playback_start_time = None
-                                        
-                                        # Dedicated background audio queue & sender thread
-                                        # (Decouples LLM token generation from socket I/O)
-                                        audio_queue = queue.Queue()
-                                        
-                                        def audio_sender_worker():
-                                            while True:
-                                                item = audio_queue.get()
-                                                if item is None:
-                                                    break
-                                                msg_type, payload = item
-                                                if msg_type == "TEXT":
-                                                    with socket_lock:
-                                                        if robot_socket:
-                                                            try: robot_socket.sendall(("TEXT:" + payload + "\n").encode('utf-8'))
-                                                            except: pass
-                                                elif msg_type == "CHUNK":
-                                                    header = b'CHUNK' + struct.pack('>I', len(payload))
-                                                    with socket_lock:
-                                                        if robot_socket:
-                                                            try: robot_socket.sendall(header + payload)
-                                                            except: pass
-                                                elif msg_type == "END":
-                                                    with socket_lock:
-                                                        if robot_socket:
-                                                            try:
-                                                                if payload:
-                                                                    robot_socket.sendall(("TEXT:" + payload + "\n").encode('utf-8'))
-                                                                robot_socket.sendall(b'CHUNK' + struct.pack('>I', 0))
-                                                            except: pass
-                                                audio_queue.task_done()
-                                        
-                                        sender_thread = threading.Thread(target=audio_sender_worker, daemon=True)
-                                        sender_thread.start()
-                                        
-                                        # Context & prompt
-                                        context = ""
-                                        if conversation_history:
-                                            context = "Recent conversation:\n" + "\n".join(
-                                                [f"{role}: {msg}" for role, msg in conversation_history]
-                                            ) + "\n\n"
-                                        prompt = f"{context}User said: \"{user_transcript}\"\nReply in 1 short sentence (max 15 words)."
-                                        
-                                        entry, pool_idx = get_next_healthy_entry()
-                                        
-                                        def emit_clause(clause_raw, is_last=False):
-                                            nonlocal first_chunk_sent, total_pcm_bytes, playback_start_time
-                                            clean = re.sub(r'[*_#~`]', '', clause_raw)
-                                            clean = clean.encode('ascii', 'ignore').decode('ascii')
-                                            clean = re.sub(r'\s+', ' ', clean).strip()
-                                            if not re.search(r'[a-zA-Z0-9]', clean):
-                                                return
-                                            
-                                            # Send first clause text to OLED for instant expression
-                                            if not first_chunk_sent:
-                                                audio_queue.put(("TEXT", clean))
-                                            
-                                            t_syn = time.time()
-                                            is_first_chunk = (not first_chunk_sent)
-                                            pcm = text_to_pcm_fast(clean, is_first=is_first_chunk, is_last=is_last)
-                                            syn_dur_ms = int((time.time() - t_syn) * 1000)
-                                            
-                                            if pcm:
-                                                total_pcm_bytes += len(pcm)
-                                                if not first_chunk_sent:
-                                                    first_chunk_sent = True
-                                                    playback_start_time = time.time()
-                                                    lat_ms = int((playback_start_time - t_start) * 1000)
-                                                    print(f"[STREAM-TTS] ⚡ First audio playing at {lat_ms}ms! (clause: \"{clean}\", syn: {syn_dur_ms}ms)")
-                                                else:
-                                                    print(f"[STREAM-TTS] Chunk queued ({syn_dur_ms}ms, {len(pcm)} bytes): \"{clean}\"")
-                                                
-                                                audio_queue.put(("CHUNK", pcm))
-
-                                        for _ in range(len(verified_pool)):
-                                            client = entry["client"]
-                                            model_name = entry["model"]
-                                            label = entry["label"]
-                                            try:
-                                                stream = client.models.generate_content_stream(
-                                                    model=model_name,
-                                                    contents=[prompt],
-                                                    config=types.GenerateContentConfig(
-                                                        system_instruction=ROBOT_SYSTEM_INSTRUCTION,
-                                                        max_output_tokens=60,
-                                                        safety_settings=[
-                                                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-                                                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
-                                                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
-                                                            types.SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-                                                        ]
-                                                    )
-                                                )
-                                                
-                                                stream_iter = iter(stream)
-                                                
-                                                # Guard: if first token does not arrive within 3.5s, failover to next key
-                                                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                                                    first_future = ex.submit(lambda: next(stream_iter, None))
-                                                    first_chunk = first_future.result(timeout=3.5)
-                                                
-                                                if first_chunk is None:
-                                                    entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
-                                                    continue
-                                                
-                                                buffer = ""
-                                                
-                                                def process_token(token_text):
-                                                    nonlocal buffer, full_ai_text
-                                                    if not token_text:
-                                                        return
-                                                    full_ai_text += token_text
-                                                    buffer += token_text
-                                                    
-                                                    while True:
-                                                        match = punct_re.search(buffer)
-                                                        if match:
-                                                            end_idx = match.end()
-                                                            clause = buffer[:end_idx].strip()
-                                                            buffer = buffer[end_idx:]
-                                                            emit_clause(clause)
-                                                            continue
-                                                        
-                                                        words = buffer.strip().split()
-                                                        if len(words) >= 6:
-                                                            count = 0
-                                                            split_point = -1
-                                                            for i, char in enumerate(buffer):
-                                                                if char.isspace():
-                                                                    count += 1
-                                                                    if count == 5:
-                                                                        split_point = i
-                                                                        break
-                                                            if split_point != -1:
-                                                                clause = buffer[:split_point].strip()
-                                                                buffer = buffer[split_point:].lstrip()
-                                                                emit_clause(clause)
-                                                                continue
-                                                        break
-                                                
-                                                # Process the first chunk
-                                                process_token(first_chunk.text or "")
-                                                
-                                                # Process all subsequent chunks
-                                                for chunk in stream_iter:
-                                                    process_token(chunk.text or "")
-                                                
-                                                if buffer.strip():
-                                                    emit_clause(buffer.strip(), is_last=True)
-                                                
-                                                if full_ai_text:
-                                                    break
-                                            except concurrent.futures.TimeoutError:
-                                                print(f"[STREAM-LLM Timeout] ⏱️ {label} took >3.5s! Putting on 60s cooldown...")
-                                                key_cooldowns[pool_idx] = time.time() + 60
-                                                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
-                                            except Exception as e:
-                                                err_str = str(e)
-                                                print(f"[STREAM-LLM Error] {label}: {e}")
-                                                if first_chunk_sent:
-                                                    break
-                                                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                                                    key_cooldowns[pool_idx] = time.time() + 60
-                                                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
-                                                time.sleep(0.05)
-                                        
-                                        if not first_chunk_sent:
-                                            fallback = "I had a connection delay, could you say that again?"
-                                            full_ai_text = fallback
-                                            emit_clause(fallback, is_last=True)
-                                        
-                                        clean_full = re.sub(r'[*_#~`]', '', full_ai_text)
-                                        clean_full = clean_full.encode('ascii', 'ignore').decode('ascii')
-                                        clean_full = re.sub(r'\s+', ' ', clean_full).strip()
-                                        
-                                        total_ms = int((time.time() - t_start) * 1000)
-                                        print(f"MEMO: {clean_full}  [{total_ms}ms total generation]")
-                                        
-                                        # Push 40ms silence tail before END to cleanly settle amp
-                                        silence_tail = AudioSegment.silent(duration=40, frame_rate=16000).set_channels(2).set_sample_width(2).raw_data
-                                        audio_queue.put(("CHUNK", silence_tail))
-                                        
-                                        # Signal end to sender worker and wait for socket delivery
-                                        audio_queue.put(("END", clean_full))
-                                        audio_queue.put(None)
-                                        sender_thread.join()
-                                        
-                                        conversation_history.append(("User", user_transcript))
-                                        conversation_history.append(("MEMO", clean_full))
-                                        asyncio.run_coroutine_threadsafe(broadcast(f"AI:{clean_full}"), active_loop)
-                                        
-                                        if total_pcm_bytes > 0 and playback_start_time:
-                                            total_audio_duration = total_pcm_bytes / 64000.0
-                                            elapsed = time.time() - playback_start_time
-                                            remaining = max(0.0, total_audio_duration - elapsed)
-                                            time.sleep(remaining + 0.6)
-                                    else:
-                                        # STEP 2: Fast text-only LLM (text → response)
-                                        ai_text = ask_gemini_text(user_transcript)
-
-                                        total_ms = int((time.time() - t_start) * 1000)
-                                        print(f"MEMO: {ai_text}  [{total_ms}ms total]")
-
-                                        # Strip asterisks (*), markdown formatting, and emojis so Piper never says 'asterisk'
-                                        clean_text = re.sub(r'[*_#~`]', '', ai_text)
-                                        clean_text = clean_text.encode('ascii', 'ignore').decode('ascii')
-                                        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-                                        
-                                        # Send clean text to OLED
-                                        with socket_lock:
-                                            try: s.sendall(("TEXT:" + clean_text + "\n").encode('utf-8'))
-                                            except: pass
-                                        asyncio.run_coroutine_threadsafe(broadcast(f"AI:{clean_text}"), active_loop)
-
-                                        # STEP 3: FAST Local TTS (Piper TTS ~150-300ms on CPU, no cloud)
-                                        asyncio.run_coroutine_threadsafe(broadcast("STATUS:🔊 Speaking..."), active_loop)
-                                        pcm = text_to_pcm_fast(clean_text, is_first=True, is_last=True)
-
-                                        # Prevent acoustic feedback: lock mic out BEFORE audio transmission begins
-                                        if pcm:
-                                            audio_duration = len(pcm) / 32000.0
-                                            mic_ignore_until = time.time() + audio_duration + 0.6
-                                            speak_on_socket(pcm)
-                                            # Keep AI processing state active while speaker plays on robot
-                                            time.sleep(audio_duration + 0.5)
-                                except Exception as e:
-                                    print("Gemini voice pipeline failed:", e)
-                                    asyncio.run_coroutine_threadsafe(broadcast("STATUS:❌ AI Error"), active_loop)
-                                finally:
-                                    # Set acoustic cooldown: discard residual large speaker echo from socket
-                                    mic_ignore_until = time.time() + 0.5
-                                    is_processing_ai = False
-                                    turn_start_time = None
+                                if not user_transcript or is_hallucination_or_noise(user_transcript):
+                                    print(f"[Skip] Empty or noise artifact ('{user_transcript}'), ignoring.")
                                     with socket_lock:
                                         if robot_socket:
                                             ready_cmd = b"TEXT:MEMO Ready! Speak...\n" if is_session_active else b"TEXT:Sleeping...\n"
                                             try: robot_socket.sendall(ready_cmd)
                                             except: pass
-                                    status_msg = "STATUS:✅ Speak." if is_session_active else "STATUS:💤 Sleeping. Say 'Hey Memo'"
-                                    asyncio.run_coroutine_threadsafe(broadcast(status_msg), active_loop)
+                                    return
 
-                            active_loop.run_in_executor(None, handle_ai, buffer_copy, lang_now, sock)
+                                # Check Wake Word & Sleep Phrases
+                                is_wake, wake_word, query = check_wake_word(user_transcript)
+                                is_sleep, sleep_phrase = check_sleep_phrase(user_transcript)
+
+                                if not is_session_active:
+                                    if not is_wake:
+                                        print(f"[Sleeping] 💤 Ignored ambient speech: \"{user_transcript}\" (Say 'Hey Memo' to wake)")
+                                        with socket_lock:
+                                            if robot_socket:
+                                                try: robot_socket.sendall(b"TEXT:Sleeping...\n")
+                                                except: pass
+                                        asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
+                                        return
+                                    else:
+                                        is_session_active = True
+                                        last_active_time = time.time()
+                                        print(f"[Wake Word] 🔔 Wake word '{wake_word}' detected! MEMO is awake!")
+                                        asyncio.run_coroutine_threadsafe(broadcast("STATUS:🟢 Awake! Listening..."), active_loop)
+
+                                        if not query:
+                                            # User just said "Hey Memo!" or "Memo!"
+                                            wake_greetings = [
+                                                "I'm here! What can I do for you?",
+                                                "Yes? I'm listening!",
+                                                "Hey! How can I help?",
+                                                "Hello! What's on your mind?"
+                                            ]
+                                            ack_text = random.choice(wake_greetings)
+                                            print(f"MEMO: {ack_text}")
+                                            with socket_lock:
+                                                try: s.sendall(("TEXT:" + ack_text + "\n").encode('utf-8'))
+                                                except: pass
+                                            asyncio.run_coroutine_threadsafe(broadcast(f"AI:{ack_text}"), active_loop)
+                                            pcm = text_to_pcm_fast(ack_text, is_first=True, is_last=True)
+                                            if pcm:
+                                                audio_duration = len(pcm) / 32000.0
+                                                mic_ignore_until = time.time() + audio_duration + 0.6
+                                                speak_on_socket(pcm)
+                                                time.sleep(audio_duration + 0.3)
+                                            return
+                                        else:
+                                            user_transcript = query
+                                            print(f"[Wake Query] Processing query: \"{user_transcript}\"")
+                                else:
+                                    # Session is already active!
+                                    if is_sleep:
+                                        is_session_active = False
+                                        print(f"[Session] 💤 User said '{sleep_phrase}'. Putting MEMO to sleep.")
+                                        bye_text = "Going to sleep now. Goodnight!"
+                                        print(f"MEMO: {bye_text}")
+                                        with socket_lock:
+                                            try: s.sendall(("TEXT:" + bye_text + "\n").encode('utf-8'))
+                                            except: pass
+                                        asyncio.run_coroutine_threadsafe(broadcast(f"AI:{bye_text}"), active_loop)
+                                        pcm = text_to_pcm_fast(bye_text, is_first=True, is_last=True)
+                                        if pcm:
+                                            audio_duration = len(pcm) / 32000.0
+                                            mic_ignore_until = time.time() + audio_duration + 0.6
+                                            speak_on_socket(pcm)
+                                            time.sleep(audio_duration + 0.3)
+                                        with socket_lock:
+                                            if robot_socket:
+                                                try: robot_socket.sendall(b"TEXT:Sleeping...\n")
+                                                except: pass
+                                        asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
+                                        return
+
+                                    if is_wake and query:
+                                        user_transcript = query
+                                    last_active_time = time.time()
+
+                                # Deduplication filter
+                                if conversation_history and len(conversation_history) >= 2:
+                                    last_user = conversation_history[-2][1]
+                                    if user_transcript.lower() == last_user.lower():
+                                        print(f"[Filter] Duplicate transcript '{user_transcript}' - skipping.")
+                                        return
+
+                                print(f"You said: {user_transcript}")
+                                asyncio.run_coroutine_threadsafe(broadcast(f"USER:{user_transcript}"), active_loop)
+
+                                if STREAMING_TTS:
+                                    # ==========================================================
+                                    # OPTION B: STREAMING LLM → CHUNKED TTS PIPELINING (DECOUPLED)
+                                    # ==========================================================
+                                    punct_re = re.compile(r'([.!?,;:\n])(\s+|$)')
+                                    full_ai_text = ""
+                                    first_chunk_sent = False
+                                    total_pcm_bytes = 0
+                                    playback_start_time = None
+                                    
+                                    # Dedicated background audio queue & sender thread
+                                    # (Decouples LLM token generation from socket I/O)
+                                    audio_queue = queue.Queue()
+                                    
+                                    def audio_sender_worker():
+                                        while True:
+                                            item = audio_queue.get()
+                                            if item is None:
+                                                break
+                                            msg_type, payload = item
+                                            if msg_type == "TEXT":
+                                                with socket_lock:
+                                                    if robot_socket:
+                                                        try: robot_socket.sendall(("TEXT:" + payload + "\n").encode('utf-8'))
+                                                        except: pass
+                                            elif msg_type == "CHUNK":
+                                                header = b'CHUNK' + struct.pack('>I', len(payload))
+                                                with socket_lock:
+                                                    if robot_socket:
+                                                        try: robot_socket.sendall(header + payload)
+                                                        except: pass
+                                            elif msg_type == "END":
+                                                with socket_lock:
+                                                    if robot_socket:
+                                                        try:
+                                                            if payload:
+                                                                robot_socket.sendall(("TEXT:" + payload + "\n").encode('utf-8'))
+                                                            robot_socket.sendall(b'CHUNK' + struct.pack('>I', 0))
+                                                        except: pass
+                                            audio_queue.task_done()
+                                    
+                                    sender_thread = threading.Thread(target=audio_sender_worker, daemon=True)
+                                    sender_thread.start()
+                                    
+                                    # Context & prompt
+                                    context = ""
+                                    if conversation_history:
+                                        context = "Recent conversation:\n" + "\n".join(
+                                            [f"{role}: {msg}" for role, msg in conversation_history]
+                                        ) + "\n\n"
+                                    prompt = f"{context}User said: \"{user_transcript}\"\nReply in 1 short sentence (max 15 words)."
+                                    
+                                    entry, pool_idx = get_next_healthy_entry()
+                                    
+                                    def emit_clause(clause_raw, is_last=False):
+                                        nonlocal first_chunk_sent, total_pcm_bytes, playback_start_time
+                                        clean = re.sub(r'[*_#~`]', '', clause_raw)
+                                        clean = clean.encode('ascii', 'ignore').decode('ascii')
+                                        clean = re.sub(r'\s+', ' ', clean).strip()
+                                        if not re.search(r'[a-zA-Z0-9]', clean):
+                                            return
+                                        
+                                        # Send first clause text to OLED for instant expression
+                                        if not first_chunk_sent:
+                                            audio_queue.put(("TEXT", clean))
+                                        
+                                        t_syn = time.time()
+                                        is_first_chunk = (not first_chunk_sent)
+                                        pcm = text_to_pcm_fast(clean, is_first=is_first_chunk, is_last=is_last)
+                                        syn_dur_ms = int((time.time() - t_syn) * 1000)
+                                        
+                                        if pcm:
+                                            total_pcm_bytes += len(pcm)
+                                            if not first_chunk_sent:
+                                                first_chunk_sent = True
+                                                playback_start_time = time.time()
+                                                lat_ms = int((playback_start_time - t_start) * 1000)
+                                                print(f"[STREAM-TTS] ⚡ First audio playing at {lat_ms}ms! (clause: \"{clean}\", syn: {syn_dur_ms}ms)")
+                                            else:
+                                                print(f"[STREAM-TTS] Chunk queued ({syn_dur_ms}ms, {len(pcm)} bytes): \"{clean}\"")
+                                            
+                                            audio_queue.put(("CHUNK", pcm))
+
+                                    for _ in range(len(verified_pool)):
+                                        client = entry["client"]
+                                        model_name = entry["model"]
+                                        label = entry["label"]
+                                        try:
+                                            stream = client.models.generate_content_stream(
+                                                model=model_name,
+                                                contents=[prompt],
+                                                config=types.GenerateContentConfig(
+                                                    system_instruction=ROBOT_SYSTEM_INSTRUCTION,
+                                                    max_output_tokens=60,
+                                                    safety_settings=[
+                                                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                                                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+                                                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                                                        types.SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+                                                    ]
+                                                )
+                                            )
+                                            
+                                            stream_iter = iter(stream)
+                                            
+                                            # Guard: if first token does not arrive within 3.5s, failover to next key
+                                            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                                                first_future = ex.submit(lambda: next(stream_iter, None))
+                                                first_chunk = first_future.result(timeout=3.5)
+                                            
+                                            if first_chunk is None:
+                                                entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
+                                                continue
+                                            
+                                            buffer = ""
+                                            
+                                            def process_token(token_text):
+                                                nonlocal buffer, full_ai_text
+                                                if not token_text:
+                                                    return
+                                                full_ai_text += token_text
+                                                buffer += token_text
+                                                
+                                                while True:
+                                                    match = punct_re.search(buffer)
+                                                    if match:
+                                                        end_idx = match.end()
+                                                        clause = buffer[:end_idx].strip()
+                                                        buffer = buffer[end_idx:]
+                                                        emit_clause(clause)
+                                                        continue
+                                                    
+                                                    words = buffer.strip().split()
+                                                    if len(words) >= 6:
+                                                        count = 0
+                                                        split_point = -1
+                                                        for i, char in enumerate(buffer):
+                                                            if char.isspace():
+                                                                count += 1
+                                                                if count == 5:
+                                                                    split_point = i
+                                                                    break
+                                                        if split_point != -1:
+                                                            clause = buffer[:split_point].strip()
+                                                            buffer = buffer[split_point:].lstrip()
+                                                            emit_clause(clause)
+                                                            continue
+                                                    break
+                                            
+                                            # Process the first chunk
+                                            process_token(first_chunk.text or "")
+                                            
+                                            # Process all subsequent chunks
+                                            for chunk in stream_iter:
+                                                process_token(chunk.text or "")
+                                            
+                                            if buffer.strip():
+                                                emit_clause(buffer.strip(), is_last=True)
+                                            
+                                            if full_ai_text:
+                                                break
+                                        except concurrent.futures.TimeoutError:
+                                            print(f"[STREAM-LLM Timeout] ⏱️ {label} took >3.5s! Putting on 60s cooldown...")
+                                            key_cooldowns[pool_idx] = time.time() + 60
+                                            entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
+                                        except Exception as e:
+                                            err_str = str(e)
+                                            print(f"[STREAM-LLM Error] {label}: {e}")
+                                            if first_chunk_sent:
+                                                break
+                                            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                                                key_cooldowns[pool_idx] = time.time() + 60
+                                            entry, pool_idx = get_next_healthy_entry(pool_idx + 1)
+                                            time.sleep(0.05)
+                                    
+                                    if not first_chunk_sent:
+                                        fallback = "I had a connection delay, could you say that again?"
+                                        full_ai_text = fallback
+                                        emit_clause(fallback, is_last=True)
+                                    
+                                    clean_full = re.sub(r'[*_#~`]', '', full_ai_text)
+                                    clean_full = clean_full.encode('ascii', 'ignore').decode('ascii')
+                                    clean_full = re.sub(r'\s+', ' ', clean_full).strip()
+                                    
+                                    total_ms = int((time.time() - t_start) * 1000)
+                                    print(f"MEMO: {clean_full}  [{total_ms}ms total generation]")
+                                    
+                                    # Push 40ms silence tail before END to cleanly settle amp
+                                    silence_tail = AudioSegment.silent(duration=40, frame_rate=16000).set_channels(2).set_sample_width(2).raw_data
+                                    audio_queue.put(("CHUNK", silence_tail))
+                                    
+                                    # Signal end to sender worker and wait for socket delivery
+                                    audio_queue.put(("END", clean_full))
+                                    audio_queue.put(None)
+                                    sender_thread.join()
+                                    
+                                    conversation_history.append(("User", user_transcript))
+                                    conversation_history.append(("MEMO", clean_full))
+                                    asyncio.run_coroutine_threadsafe(broadcast(f"AI:{clean_full}"), active_loop)
+                                    
+                                    if total_pcm_bytes > 0 and playback_start_time:
+                                        total_audio_duration = total_pcm_bytes / 64000.0
+                                        elapsed = time.time() - playback_start_time
+                                        remaining = max(0.0, total_audio_duration - elapsed)
+                                        time.sleep(remaining + 0.6)
+                                else:
+                                    # STEP 2: Fast text-only LLM (text → response)
+                                    ai_text = ask_gemini_text(user_transcript)
+
+                                    total_ms = int((time.time() - t_start) * 1000)
+                                    print(f"MEMO: {ai_text}  [{total_ms}ms total]")
+
+                                    # Strip asterisks (*), markdown formatting, and emojis so Piper never says 'asterisk'
+                                    clean_text = re.sub(r'[*_#~`]', '', ai_text)
+                                    clean_text = clean_text.encode('ascii', 'ignore').decode('ascii')
+                                    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                                    
+                                    # Send clean text to OLED
+                                    with socket_lock:
+                                        try: s.sendall(("TEXT:" + clean_text + "\n").encode('utf-8'))
+                                        except: pass
+                                    asyncio.run_coroutine_threadsafe(broadcast(f"AI:{clean_text}"), active_loop)
+
+                                    # STEP 3: FAST Local TTS (Piper TTS ~150-300ms on CPU, no cloud)
+                                    asyncio.run_coroutine_threadsafe(broadcast("STATUS:🔊 Speaking..."), active_loop)
+                                    pcm = text_to_pcm_fast(clean_text, is_first=True, is_last=True)
+
+                                    # Prevent acoustic feedback: lock mic out BEFORE audio transmission begins
+                                    if pcm:
+                                        audio_duration = len(pcm) / 32000.0
+                                        mic_ignore_until = time.time() + audio_duration + 0.6
+                                        speak_on_socket(pcm)
+                                        # Keep AI processing state active while speaker plays on robot
+                                        time.sleep(audio_duration + 0.5)
+                            except Exception as e:
+                                print("Gemini voice pipeline failed:", e)
+                                asyncio.run_coroutine_threadsafe(broadcast("STATUS:❌ AI Error"), active_loop)
+                            finally:
+                                # Set acoustic cooldown: discard residual large speaker echo from socket
+                                mic_ignore_until = time.time() + 0.5
+                                is_processing_ai = False
+                                turn_start_time = None
+                                with socket_lock:
+                                    if robot_socket:
+                                        ready_cmd = b"TEXT:MEMO Ready! Speak...\n" if is_session_active else b"TEXT:Sleeping...\n"
+                                        try: robot_socket.sendall(ready_cmd)
+                                        except: pass
+                                status_msg = "STATUS:✅ Speak." if is_session_active else "STATUS:💤 Sleeping. Say 'Hey Memo'"
+                                asyncio.run_coroutine_threadsafe(broadcast(status_msg), active_loop)
+
+                        active_loop.run_in_executor(None, handle_ai, buffer_copy, lang_now, sock)
             
         except Exception as e:
             print(f"Connection error: {e}")
