@@ -19,8 +19,10 @@ import concurrent.futures
 import wave
 import tempfile
 import numpy as np
+import random
 import edge_tts
 from pydub import AudioSegment
+from pydub.effects import normalize
 import builtins
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
@@ -113,7 +115,7 @@ RULES:
 TCP_PORT = 8005
 SAMPLE_RATE = 16000
 SILENCE_THRESHOLD = 200  # Lower = more sensitive mic detection
-MAX_SILENCE_SECONDS = 0.65  # Seconds of silence before sending to Gemini (0.65s gives natural pause)
+MAX_SILENCE_SECONDS = 0.45  # Seconds of silence before sending to Gemini (0.45s gives snappy turn-taking)
 STREAMING_TTS = False  # Set False for crystal-clear Option A (PSRAM audio buffering, sub-2s latency, zero breaking radio noise)
 
 app = FastAPI(title="Gemini AI Robot")
@@ -126,6 +128,64 @@ socket_lock = threading.Lock()
 is_processing_ai = False
 mic_ignore_until = 0
 conversation_history = collections.deque(maxlen=6)
+
+# --- CONVERSATION SESSION & WAKE WORD STATE ---
+is_session_active = False
+last_active_time = 0.0
+SESSION_TIMEOUT_SECONDS = 90.0  # 1.5 minutes of inactivity before going to sleep
+
+WAKE_PATTERNS = [
+    # Variations of Hey Memo / Hey Name O / Memo / Momo / Maymo
+    r"\bhey\s+(?:memo|name\s*o|namo|momo|maymo|mimo|me\s*mo|mem\s*o|robot|there|buddy)\b",
+    r"\b(?:hi|hello|ok)\s+(?:memo|name\s*o|namo|momo|maymo|mimo|me\s*o|robot)\b",
+    r"\b(?:memo|name\s*o|namo|momo|maymo|mimo|me\s*mo|mem\s*o)\b",
+    # Sensitive wake triggers: any greeting at the beginning of speech
+    r"^hey\b",
+    r"^hello\b",
+    r"^hi\b",
+]
+SLEEP_WORDS = ["go to sleep", "sleep now", "goodbye memo", "bye memo", "good night", "goodnight", "bye-bye", "sleep memo"]
+
+def check_wake_word(transcript):
+    text_norm = re.sub(r"[,.!?]+", " ", transcript.lower())
+    text_norm = re.sub(r"\s+", " ", text_norm).strip()
+    
+    for pattern in WAKE_PATTERNS:
+        match = re.search(pattern, text_norm)
+        if match:
+            start, end = match.span()
+            matched_wake = text_norm[start:end]
+            query = (text_norm[:start] + " " + text_norm[end:]).strip()
+            # Clean up residual name variations from start of query
+            query = re.sub(r"^(?:memo|name\s*o|namo|momo|robot)\b", "", query).strip()
+            query = re.sub(r"\s+", " ", query).strip()
+            return True, matched_wake, query
+            
+    return False, None, text_norm
+
+def check_sleep_phrase(transcript):
+    text_norm = transcript.lower().strip()
+    for sp in SLEEP_WORDS:
+        if sp in text_norm:
+            return True, sp
+    return False, None
+
+def is_hallucination_or_noise(text):
+    text_clean = text.strip().lower()
+    if not text_clean:
+        return True
+    words = [w.strip(".,!?\"'\''") for w in text_clean.split()]
+    words = [w for w in words if w]
+    if not words:
+        return True
+    if len(words) >= 3 and len(set(words)) <= 1:
+        return True
+    if len(words) >= 4 and (len(set(words)) / len(words)) < 0.4:
+        return True
+    noise_artifacts = {"thank you.", "thank you", "thanks for watching.", "thanks for watching", "bye.", "bye bye.", "bye bye", "you", "."}
+    if text_clean in noise_artifacts:
+        return True
+    return False
 
 html = """
 <!DOCTYPE html>
@@ -328,8 +388,8 @@ def trim_silence_pcm(audio_bytes, threshold=220, frame_size=640):
 # ── LOCAL WHISPER STT MODEL ───────────────────────────────────────────────
 print("⏳ Loading Whisper STT model...")
 try:
-    whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    print("✅ Whisper STT model loaded!")
+    whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=6)
+    print("✅ Whisper STT model loaded! (6 CPU threads)")
 except Exception as e:
     print(f"⚠️ Whisper load failed: {e}. Will use Gemini STT fallback.")
     whisper_model = None
@@ -371,6 +431,8 @@ def transcribe_audio(audio_bytes):
                 condition_on_previous_text=False,
                 temperature=0.0,
                 vad_filter=False,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
             )
             transcript = " ".join([seg.text.strip() for seg in segments]).strip()
             elapsed = int((time.time() - t0) * 1000)
@@ -604,7 +666,7 @@ def text_to_pcm(text):
                 mp3_buf.write(chunk["data"])
         mp3_buf.seek(0)
         audio = AudioSegment.from_mp3(mp3_buf)
-        audio = audio + 10
+        audio = normalize(audio, headroom=1.0)
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
         return audio.raw_data
     return asyncio.run(run())
@@ -625,8 +687,8 @@ def text_to_pcm_fast(text, is_first=False, is_last=False):
                 frame_rate=piper_voice.config.sample_rate,
                 channels=1
             )
-            # Boost volume by +10dB and convert to 16kHz mono (50% smaller Wi-Fi payload)
-            audio = (audio + 10).set_frame_rate(16000).set_channels(1).set_sample_width(2)
+            # Peak normalize to -1.0 dBFS (cleanest, loud volume without digital clipping)
+            audio = normalize(audio, headroom=1.0).set_frame_rate(16000).set_channels(1).set_sample_width(2)
             
             # Anti-pop windowing: smooth fade-in and fade-out to eliminate step discontinuities
             fade_in_ms = 25 if is_first else 12
@@ -684,11 +746,14 @@ def audio_listener_loop(active_loop, target_ip):
             sock.settimeout(None)
             with socket_lock:
                 robot_socket = sock
-            # Instantly trigger ESP32 server.available() and update screen
-            try: sock.sendall(b"TEXT:AI Robot Active! Speak now...\n")
+            global is_session_active, last_active_time
+            is_session_active = False
+            last_active_time = 0.0
+            # Instantly trigger ESP32 server.available() and show sleeping state
+            try: sock.sendall(b"TEXT:Sleeping...\n")
             except: pass
-            print("Connected to Robot Wi-Fi!")
-            asyncio.run_coroutine_threadsafe(broadcast("STATUS:✅ Connected! Speak."), active_loop)
+            print("Connected to Robot Wi-Fi! (Sleeping — say 'Hey Memo' to wake)")
+            asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
             
             is_speaking = False
             silence_start = 0
@@ -712,6 +777,17 @@ def audio_listener_loop(active_loop, target_ip):
             while True:
                 chunk = sock.recv(1024)
                 if not chunk: break
+
+                # Auto-sleep after inactivity timeout (e.g. 90s)
+                if is_session_active and not is_speaking and not is_processing_ai:
+                    if (time.time() - last_active_time) > SESSION_TIMEOUT_SECONDS:
+                        is_session_active = False
+                        print(f"[Session] 💤 {int(SESSION_TIMEOUT_SECONDS)}s of inactivity. MEMO is now sleeping.")
+                        with socket_lock:
+                            if robot_socket:
+                                try: robot_socket.sendall(b"TEXT:Sleeping...\n")
+                                except: pass
+                        asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
                 
                 if is_processing_ai or time.time() < mic_ignore_until:
                     # Discard audio data while AI is processing or during post-speech acoustic cooldown
@@ -761,7 +837,7 @@ def audio_listener_loop(active_loop, target_ip):
                 
                 # Dual VAD Thresholds (Dynamic based on true ambient room noise):
                 start_threshold = max(100.0, noise_floor_rms * 2.2)
-                silence_threshold = max(50.0, noise_floor_rms * 1.4)
+                silence_threshold = max(80.0, noise_floor_rms * 1.75)
                 
                 if not is_speaking:
                     pre_roll_buffer.append(scaled_chunk)
@@ -795,9 +871,9 @@ def audio_listener_loop(active_loop, target_ip):
                         if silence_start == 0:
                             silence_start = now
                         
-                        # Stop conditions: silence pause OR max phrase safety cutoff (6.0s)
+                        # Stop conditions: silence pause (450ms) OR max phrase safety cutoff (5.0s)
                         silence_met = (silence_start > 0 and (now - silence_start > MAX_SILENCE_SECONDS))
-                        max_phrase_met = (now - speech_start_time) > 6.0
+                        max_phrase_met = (now - speech_start_time) > 5.0
                         
                         if silence_met or max_phrase_met:
                             global turn_start_time
@@ -819,7 +895,7 @@ def audio_listener_loop(active_loop, target_ip):
                             lang_now = current_language
                             
                             def handle_ai(buf, lang, s):
-                                global is_processing_ai, turn_start_time, mic_ignore_until
+                                global is_processing_ai, turn_start_time, mic_ignore_until, is_session_active, last_active_time
                                 is_processing_ai = True
                                 if turn_start_time is None:
                                     turn_start_time = time.time()
@@ -849,9 +925,85 @@ def audio_listener_loop(active_loop, target_ip):
                                     # STEP 1: Fast Local STT (audio → text via Whisper)
                                     user_transcript = transcribe_audio(clean_buf)
 
-                                    if not user_transcript:
-                                        print("[Skip] No speech detected, ignoring.")
+                                    if not user_transcript or is_hallucination_or_noise(user_transcript):
+                                        print(f"[Skip] Empty or noise artifact ('{user_transcript}'), ignoring.")
+                                        with socket_lock:
+                                            if robot_socket:
+                                                ready_cmd = b"TEXT:MEMO Ready! Speak...\n" if is_session_active else b"TEXT:Sleeping...\n"
+                                                try: robot_socket.sendall(ready_cmd)
+                                                except: pass
                                         return
+
+                                    # Check Wake Word & Sleep Phrases
+                                    is_wake, wake_word, query = check_wake_word(user_transcript)
+                                    is_sleep, sleep_phrase = check_sleep_phrase(user_transcript)
+
+                                    if not is_session_active:
+                                        if not is_wake:
+                                            print(f"[Sleeping] 💤 Ignored ambient speech: \"{user_transcript}\" (Say 'Hey Memo' to wake)")
+                                            with socket_lock:
+                                                if robot_socket:
+                                                    try: robot_socket.sendall(b"TEXT:Sleeping...\n")
+                                                    except: pass
+                                            asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
+                                            return
+                                        else:
+                                            is_session_active = True
+                                            last_active_time = time.time()
+                                            print(f"[Wake Word] 🔔 Wake word '{wake_word}' detected! MEMO is awake!")
+                                            asyncio.run_coroutine_threadsafe(broadcast("STATUS:🟢 Awake! Listening..."), active_loop)
+
+                                            if not query:
+                                                # User just said "Hey Memo!" or "Memo!"
+                                                wake_greetings = [
+                                                    "I'm here! What can I do for you?",
+                                                    "Yes? I'm listening!",
+                                                    "Hey! How can I help?",
+                                                    "Hello! What's on your mind?"
+                                                ]
+                                                ack_text = random.choice(wake_greetings)
+                                                print(f"MEMO: {ack_text}")
+                                                with socket_lock:
+                                                    try: s.sendall(("TEXT:" + ack_text + "\n").encode('utf-8'))
+                                                    except: pass
+                                                asyncio.run_coroutine_threadsafe(broadcast(f"AI:{ack_text}"), active_loop)
+                                                pcm = text_to_pcm_fast(ack_text, is_first=True, is_last=True)
+                                                if pcm:
+                                                    audio_duration = len(pcm) / 32000.0
+                                                    mic_ignore_until = time.time() + audio_duration + 0.6
+                                                    speak_on_socket(pcm)
+                                                    time.sleep(audio_duration + 0.3)
+                                                return
+                                            else:
+                                                user_transcript = query
+                                                print(f"[Wake Query] Processing query: \"{user_transcript}\"")
+                                    else:
+                                        # Session is already active!
+                                        if is_sleep:
+                                            is_session_active = False
+                                            print(f"[Session] 💤 User said '{sleep_phrase}'. Putting MEMO to sleep.")
+                                            bye_text = "Going to sleep now. Goodnight!"
+                                            print(f"MEMO: {bye_text}")
+                                            with socket_lock:
+                                                try: s.sendall(("TEXT:" + bye_text + "\n").encode('utf-8'))
+                                                except: pass
+                                            asyncio.run_coroutine_threadsafe(broadcast(f"AI:{bye_text}"), active_loop)
+                                            pcm = text_to_pcm_fast(bye_text, is_first=True, is_last=True)
+                                            if pcm:
+                                                audio_duration = len(pcm) / 32000.0
+                                                mic_ignore_until = time.time() + audio_duration + 0.6
+                                                speak_on_socket(pcm)
+                                                time.sleep(audio_duration + 0.3)
+                                            with socket_lock:
+                                                if robot_socket:
+                                                    try: robot_socket.sendall(b"TEXT:Sleeping...\n")
+                                                    except: pass
+                                            asyncio.run_coroutine_threadsafe(broadcast("STATUS:💤 Sleeping. Say 'Hey Memo'"), active_loop)
+                                            return
+
+                                        if is_wake and query:
+                                            user_transcript = query
+                                        last_active_time = time.time()
 
                                     # Deduplication filter
                                     if conversation_history and len(conversation_history) >= 2:
@@ -1107,9 +1259,11 @@ def audio_listener_loop(active_loop, target_ip):
                                     turn_start_time = None
                                     with socket_lock:
                                         if robot_socket:
-                                            try: robot_socket.sendall(b"TEXT:MEMO Ready! Speak...\n")
+                                            ready_cmd = b"TEXT:MEMO Ready! Speak...\n" if is_session_active else b"TEXT:Sleeping...\n"
+                                            try: robot_socket.sendall(ready_cmd)
                                             except: pass
-                                    asyncio.run_coroutine_threadsafe(broadcast("STATUS:✅ Speak."), active_loop)
+                                    status_msg = "STATUS:✅ Speak." if is_session_active else "STATUS:💤 Sleeping. Say 'Hey Memo'"
+                                    asyncio.run_coroutine_threadsafe(broadcast(status_msg), active_loop)
 
                             active_loop.run_in_executor(None, handle_ai, buffer_copy, lang_now, sock)
             
